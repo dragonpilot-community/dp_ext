@@ -21,7 +21,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 #
-# Version = 2024-1-29
+# Version = 2024-02-28
 from common.numpy_fast import interp
 
 # d-e2e, from modeldata.h
@@ -50,6 +50,8 @@ SET_MODE_TIMEOUT = 10
 
 MPC_FCW_WINDOW_SIZE = 5
 MPC_FCW_PROB = 0.6
+
+V_ACC_MIN = 9.72
 
 class SNG_State:
   off = 0
@@ -98,6 +100,7 @@ class DynamicEndtoEndController:
     self._slowness_gmac = GenericMovingAverageCalculator(window_size=SLOWNESS_WINDOW_SIZE)
     self._has_slowness = False
 
+    self._has_nav_enabled = False
     self._has_nav_instruction = False
 
     self._dangerous_ttc_gmac = GenericMovingAverageCalculator(window_size=DANGEROUS_TTC_WINDOW_SIZE)
@@ -129,18 +132,19 @@ class DynamicEndtoEndController:
 
     # fcw detection
     self._mpc_fcw_gmac.add_data(self._mpc_fcw_crash_cnt > 0)
-    self._has_mpc_fcw = self._mpc_fcw_gmac.get_moving_average() >= MPC_FCW_PROB
+    self._has_mpc_fcw = self._mpc_fcw_gmac.get_moving_average() > MPC_FCW_PROB
 
     # nav enable detection
-    self._has_nav_instruction = maneuver_distance / max(car_state.vEgo, 1) < 13
+    self._has_nav_enabled = md.navEnabled
+    self._has_nav_instruction = self._has_nav_enabled and maneuver_distance / max(car_state.vEgo, 1) < 13
 
     # lead detection
     self._lead_gmac.add_data(lead_one.status)
-    self._has_lead_filtered = self._lead_gmac.get_moving_average() >= LEAD_PROB
+    self._has_lead_filtered = self._lead_gmac.get_moving_average() > LEAD_PROB
 
     # slow down detection
     self._slow_down_gmac.add_data(len(md.orientation.x) == len(md.position.x) == TRAJECTORY_SIZE and md.position.x[TRAJECTORY_SIZE - 1] < interp(self._v_ego_kph, SLOW_DOWN_BP, SLOW_DOWN_DIST))
-    self._has_slow_down = self._slow_down_gmac.get_moving_average() >= SLOW_DOWN_PROB
+    self._has_slow_down = self._slow_down_gmac.get_moving_average() > SLOW_DOWN_PROB
 
     # blinker detection
     self._has_blinkers = car_state.leftBlinker or car_state.rightBlinker
@@ -162,7 +166,7 @@ class DynamicEndtoEndController:
     # slowness detection
     if not self._has_standstill:
       self._slowness_gmac.add_data(self._v_ego_kph <= (self._v_cruise_kph*SLOWNESS_CRUISE_OFFSET))
-      self._has_slowness = self._slowness_gmac.get_moving_average() >= SLOWNESS_PROB
+      self._has_slowness = self._slowness_gmac.get_moving_average() > SLOWNESS_PROB
 
     # dangerous TTC detection
     if not self._has_lead_filtered and self._has_lead_filtered_prev:
@@ -180,21 +184,16 @@ class DynamicEndtoEndController:
     self._has_lead_filtered_prev = self._has_lead_filtered
     self._frame += 1
 
-  def _blended_priority_mode(self):
+  def _radarless_mode(self):
     # when mpc fcw crash prob is high
     # use blended to slow down quickly
     if self._has_mpc_fcw:
       self._set_mode('blended')
       return
 
-    # Nav enabled and distance to upcoming turning is 300 or below
-    if self._has_nav_instruction:
-      self._set_mode('blended')
-      return
-
-    # when blinker is on and speed is driving below highway cruise speed: blended
+    # when blinker is on and speed is driving below V_ACC_MIN: blended
     # we dont want it to switch mode at higher speed, blended may trigger hard brake
-    if self._has_blinkers and self._v_ego_kph < HIGHWAY_CRUISE_KPH:
+    if self._has_blinkers and self._v_ego_kph < V_ACC_MIN:
       self._set_mode('blended')
       return
 
@@ -223,14 +222,19 @@ class DynamicEndtoEndController:
       self._set_mode('blended')
       return
 
+    # Nav enabled and distance to upcoming turn
+    if self._has_nav_instruction:
+      self._set_mode('blended')
+      return
+
     # car driving at speed lower than set speed: acc
     if self._has_slowness:
       self._set_mode('acc')
       return
 
-    self._set_mode('blended')
+    self._set_mode('acc')
 
-  def _acc_priority_mode(self):
+  def _radar_mode(self):
     # when mpc fcw crash prob is high
     # use blended to slow down quickly
     if self._has_mpc_fcw:
@@ -242,9 +246,9 @@ class DynamicEndtoEndController:
       self._set_mode('acc')
       return
 
-    # when blinker is on and speed is driving below highway cruise speed: blended
+    # when blinker is on and speed is driving below V_ACC_MIN: blended
     # we dont want it to switch mode at higher speed, blended may trigger hard brake
-    if self._has_blinkers and self._v_ego_kph < HIGHWAY_CRUISE_KPH:
+    if self._has_blinkers and self._v_ego_kph < V_ACC_MIN:
       self._set_mode('blended')
       return
 
@@ -260,14 +264,14 @@ class DynamicEndtoEndController:
       self._set_mode('blended')
       return
 
+    # Nav enabled and distance to upcoming turn
+    if self._has_nav_instruction:
+      self._set_mode('blended')
+      return
+
     # car driving at speed lower than set speed: acc
     if self._has_slowness:
       self._set_mode('acc')
-      return
-
-    # Nav enabled and distance to upcoming turning is 300 or below
-    if self._has_nav_instruction:
-      self._set_mode('blended')
       return
 
     self._set_mode('acc')
@@ -276,9 +280,9 @@ class DynamicEndtoEndController:
     if self._is_enabled:
       self._update(car_state, lead_one, md, controls_state, maneuver_distance)
       if radar_unavailable:
-        self._blended_priority_mode()
+        self._radarless_mode()
       else:
-        self._acc_priority_mode()
+        self._radar_mode()
 
     self._mode_prev = self._mode
     return self._mode
