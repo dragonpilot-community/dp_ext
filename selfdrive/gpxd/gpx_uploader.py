@@ -33,7 +33,7 @@ import glob
 import requests
 import json
 
-from dp_ext.utils import is_private_ip
+from openpilot.dp_ext.utils import is_private_ip
 
 # customisable values
 GPX_LOG_PATH = '/data/media/0/gpx_logs/'
