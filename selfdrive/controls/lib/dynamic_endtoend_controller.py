@@ -100,8 +100,8 @@ class DynamicEndtoEndController:
     self._slowness_gmac = GenericMovingAverageCalculator(window_size=SLOWNESS_WINDOW_SIZE)
     self._has_slowness = False
 
-    self._has_nav_enabled = False
-    self._has_nav_instruction = False
+    #self._has_nav_enabled = False
+    #self._has_nav_instruction = False
 
     self._dangerous_ttc_gmac = GenericMovingAverageCalculator(window_size=DANGEROUS_TTC_WINDOW_SIZE)
     self._has_dangerous_ttc = False
@@ -124,7 +124,7 @@ class DynamicEndtoEndController:
     self._set_mode_timeout = 0
     pass
 
-  def _update(self, car_state, lead_one, md, controls_state, maneuver_distance):
+  def _update(self, car_state, lead_one, md, controls_state):
     self._v_ego_kph = car_state.vEgo * 3.6
     self._v_cruise_kph = controls_state.vCruise
     self._has_lead = lead_one.status
@@ -135,8 +135,8 @@ class DynamicEndtoEndController:
     self._has_mpc_fcw = self._mpc_fcw_gmac.get_moving_average() > MPC_FCW_PROB
 
     # nav enable detection
-    self._has_nav_enabled = md.navEnabled
-    self._has_nav_instruction = self._has_nav_enabled and maneuver_distance / max(car_state.vEgo, 1) < 13
+    #self._has_nav_enabled = md.navEnabled
+    #self._has_nav_instruction = self._has_nav_enabled and maneuver_distance / max(car_state.vEgo, 1) < 13
 
     # lead detection
     self._lead_gmac.add_data(lead_one.status)
@@ -223,9 +223,9 @@ class DynamicEndtoEndController:
       return
 
     # Nav enabled and distance to upcoming turn
-    if self._has_nav_instruction:
-      self._set_mode('blended')
-      return
+    #if self._has_nav_instruction:
+    #  self._set_mode('blended')
+    #  return
 
     # car driving at speed lower than set speed: acc
     if self._has_slowness:
@@ -265,9 +265,9 @@ class DynamicEndtoEndController:
       return
 
     # Nav enabled and distance to upcoming turn
-    if self._has_nav_instruction:
-      self._set_mode('blended')
-      return
+    #if self._has_nav_instruction:
+    #  self._set_mode('blended')
+    #  return
 
     # car driving at speed lower than set speed: acc
     if self._has_slowness:
@@ -276,9 +276,9 @@ class DynamicEndtoEndController:
 
     self._set_mode('acc')
 
-  def get_mpc_mode(self, radar_unavailable, car_state, lead_one, md, controls_state, maneuver_distance):
+  def get_mpc_mode(self, radar_unavailable, car_state, lead_one, md, controls_state):
     if self._is_enabled:
-      self._update(car_state, lead_one, md, controls_state, maneuver_distance)
+      self._update(car_state, lead_one, md, controls_state)
       if radar_unavailable:
         self._radarless_mode()
       else:
