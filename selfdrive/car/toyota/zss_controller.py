@@ -57,7 +57,6 @@ class ZSSController:
             return steering_angle_deg
 
         # too many failure, fallback to stock
-        print("b")
         if self._threshold_count > THRESHOLD_COUNT:
             print("ZSS: Too many failure, fallback to stock.")
             return steering_angle_deg
