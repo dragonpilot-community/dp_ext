@@ -46,15 +46,15 @@ class DoorLockController:
         # dp - door auto lock / unlock logic
         # thanks to AlexandreSato & cydia2020
         # https://github.com/AlexandreSato/animalpilot/blob/personal/doors.py
+        message = []
         if not door_open:
             if gear == GearShifter.park and gear != self._gear_prev:
-                self._dp_toyota_auto_lock_once = False
                 if self._dp_toyota_auto_unlock:
-                    return 0x750, UNLOCK_CMD, 0
+                    message = [0x750, UNLOCK_CMD, 0]
+                self._dp_toyota_auto_lock_once = False
             elif gear == GearShifter.drive and not self._dp_toyota_auto_lock_once and v_ego >= LOCK_AT_SPEED:
-                self._dp_toyota_auto_lock_once = True
                 if self._dp_toyota_auto_lock:
-                    return 0x750, LOCK_CMD, 0
+                    message = [0x750, LOCK_CMD, 0]
+                self._dp_toyota_auto_lock_once = True
             self._gear_prev = gear
-
-        return []
+        return message
