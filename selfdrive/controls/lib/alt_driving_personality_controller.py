@@ -29,7 +29,7 @@ class AlternativeDrivingPersonalityController:
     def __init__(self):
         params = Params()
         self._mode = params.get_bool("dp_long_alt_driving_personality_mode")
-        self._speed = params.get_bool("dp_long_alt_driving_personality_speed") * CV.KPH_TO_MS
+        self._speed = int(params.get("dp_long_alt_driving_personality_speed")) * CV.KPH_TO_MS
         self._active = False
 
     def update(self, v_ego):
