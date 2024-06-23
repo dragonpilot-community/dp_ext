@@ -86,6 +86,7 @@ class DynamicEndtoEndController:
     self._is_enabled = False
     self._mode = 'acc'
     self._mode_prev = 'acc'
+    self._mode_changed = False
     self._frame = 0
 
     self._lead_gmac = GenericMovingAverageCalculator(window_size=LEAD_WINDOW_SIZE)
@@ -193,16 +194,16 @@ class DynamicEndtoEndController:
 
     # when blinker is on and speed is driving below V_ACC_MIN: blended
     # we dont want it to switch mode at higher speed, blended may trigger hard brake
-    if self._has_blinkers and self._v_ego_kph < V_ACC_MIN:
-      self._set_mode('blended')
-      return
+    # if self._has_blinkers and self._v_ego_kph < V_ACC_MIN:
+    #   self._set_mode('blended')
+    #   return
 
     # when at highway cruise and SNG: blended
     # ensuring blended mode is used because acc is bad at catching SNG lead car
     # especially those who accel very fast and then brake very hard.
-    if self._sng_state == SNG_State.going and self._v_cruise_kph >= HIGHWAY_CRUISE_KPH:
-      self._set_mode('blended')
-      return
+    # if self._sng_state == SNG_State.going and self._v_cruise_kph >= HIGHWAY_CRUISE_KPH:
+    #   self._set_mode('blended')
+    #   return
 
     # when standstill: blended
     # in case of lead car suddenly move away under traffic light, acc mode wont brake at traffic light.
@@ -276,16 +277,21 @@ class DynamicEndtoEndController:
 
     self._set_mode('acc')
 
-  def get_mpc_mode(self, radar_unavailable, car_state, lead_one, md, controls_state): #$, maneuver_distance):
+  def update(self, radar_unavailable, car_state, lead_one, md, controls_state): #$, maneuver_distance):
     if self._is_enabled:
       self._update(car_state, lead_one, md, controls_state) #, maneuver_distance)
       if radar_unavailable:
         self._radarless_mode()
       else:
         self._radar_mode()
-
+    self._mode_changed = self._mode != self._mode_prev
     self._mode_prev = self._mode
+
+  def get_mpc_mode(self):
     return self._mode
+
+  def has_changed(self):
+    return self._mode_changed
 
   def set_enabled(self, enabled):
     self._is_enabled = enabled
