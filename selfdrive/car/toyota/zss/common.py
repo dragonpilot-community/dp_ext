@@ -27,4 +27,4 @@
 from openpilot.common.params import Params
 
 ENABLED = Params().get_bool("dp_toyota_zss")
-ALKA = Params().getBool("dp_alka")
+ALKA = Params().get_bool("dp_alka")

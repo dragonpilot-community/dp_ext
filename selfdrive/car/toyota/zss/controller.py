@@ -33,7 +33,6 @@ THRESHOLD_COUNT = 10
 
 class ZSSController:
     def __init__(self):
-        params = Params()
         self._enabled = ENABLED
         self._dp_toyota_zss_active = False
         self._offset_compute_required = False
