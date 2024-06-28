@@ -49,6 +49,8 @@ class BrakeHoldState:
             self.can_parser = CANParser('toyota_brake_hold', messages, 0)
 
     def update_states(self, standstill, cruise_state, gas_pressed, brake_pressed, gear_shifter):
+        if not self._enabled:
+            return
         can_strings = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
         self.can_parser.update_strings(can_strings)
 
