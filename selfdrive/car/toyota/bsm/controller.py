@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # The MIT License
 #
-# Copyright (c) 2019-, Rick Lan, dragonpilot community, and a number of other of contributors.
+# Copyright (c) 2019-, arne182, kumar, Rick Lan.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
