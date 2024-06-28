@@ -44,7 +44,6 @@ class BrakeHoldController:
         if frame % 2 == 0:
             if brakehold_governor:
                 can_sends.append(create_brakehold_command(self.packer, {}, True if frame % 730 < 727 else False))
-                print("brakeholding!!")
             else:
                 can_sends.append(create_brakehold_command(self.packer, stock_aeb, False))
 
