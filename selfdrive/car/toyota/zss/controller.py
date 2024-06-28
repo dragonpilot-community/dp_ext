@@ -24,7 +24,7 @@
 # Code was inspired from Erich Moraga (https://github.com/ErichMoraga/)
 # Rewrite due to poor written originally hence the license declaration above.
 
-from openpilot.common.params import Params
+from openpilot.dp_ext.selfdrive.car.toyota.zss.common import ENABLED, ALKA
 from opendbc.can.parser import CANParser
 from cereal import messaging
 
@@ -34,7 +34,7 @@ THRESHOLD_COUNT = 10
 class ZSSController:
     def __init__(self):
         params = Params()
-        self._dp_toyota_zss = params.get_bool('dp_toyota_zss')
+        self._enabled = ENABLED
         self._dp_toyota_zss_active = False
         self._offset_compute_required = False
         self._lka_active_prev = False
@@ -42,18 +42,18 @@ class ZSSController:
         self._threshold_count = 0
 
         # do not init pass here
-        if not self._dp_toyota_zss:
+        if not self._enabled:
             return
 
-        self._dp_alka = params.get_bool('dp_alka')
+        self._dp_alka = ALKA
         self.can_sock = messaging.sub_sock('can')
         messages = [("SECONDARY_STEER_ANGLE", 0)]
-        self.can_parser = CANParser('zss', messages, 0)
+        self.can_parser = CANParser('toyota_zss', messages, 0)
 
 
     def get_steering_angle_deg(self, main_on, cruise_active, steering_angle_deg):
         # off, fall back to stock
-        if not self._dp_toyota_zss:
+        if not self._enabled:
             return steering_angle_deg
 
         # too many failure, fallback to stock
