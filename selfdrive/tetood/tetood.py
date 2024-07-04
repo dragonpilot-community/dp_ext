@@ -4,15 +4,20 @@ from typing import List, Tuple
 import time
 import rtree
 import math
-from openpilot.dp_ext.selfdrive.tetood.hmm_map_matcher import HMMMapMatcher
-from openpilot.dp_ext.selfdrive.tetood.overpass_api_helper import OverpassAPIHelper
+import threading
+
+from openpilot.dp_ext.selfdrive.tetood.lib.hmm_map_matcher import HMMMapMatcher
+from openpilot.dp_ext.selfdrive.tetood.lib.overpass_api_helper import OverpassAPIHelper
+from openpilot.dp_ext.selfdrive.tetood.lib.utils import haversine_distance
 
 import cereal.messaging as messaging
 from cereal import log
 
+RADIUS = 3500
 
 class TeToo:
     def __init__(self):
+        self.current_v_ego = 0.
         self.current_position = None
         self.current_bearing = None
         self.prefetched_data = None
@@ -21,7 +26,12 @@ class TeToo:
         self.last_fetch_position = None
         self.gps_history = []
         self.map_matcher = None
-        self.overpass_helper = None
+        self.current_way = None
+
+        self.fetching_thread = None
+
+        self.data_lock = threading.Lock()
+        self.current_road_network = None
 
     def update_position(self, lat: float, lon: float, bearing: float):
         self.current_position = (lat, lon)
@@ -34,36 +44,52 @@ class TeToo:
         return self._get_road_info()
 
     def _check_and_fetch_data(self):
-        if not self.last_fetch_position or self._distance(self.current_position, self.last_fetch_position) > 1000:
+        if not self.last_fetch_position or \
+                haversine_distance(self.current_position, self.last_fetch_position) > RADIUS - self._get_boundary_offset():
             self._fetch_data()
 
-    def _fetch_data(self):
-        self.overpass_helper = OverpassAPIHelper()
-        print("fetching")
-        self.prefetched_data = self.overpass_helper.fetch_data(self.current_position[0], self.current_position[1])
-        print("building network")
-        self._build_road_network()
-        self.last_fetch_position = self.current_position
+    def _get_boundary_offset(self):
+        # 16.67 m/s = 60 km/h
+        return 300 if self.current_v_ego <= 16.67 else 600
 
-        # Implement Overpass API query here
-        # After fetching and processing data:
-        self.map_matcher = HMMMapMatcher(self.road_network)
+    def _fetch_data(self):
+        def fetch():
+            overpass_helper = OverpassAPIHelper()
+            print("fetching")
+            self.prefetched_data = overpass_helper.fetch_data(self.current_position[0], self.current_position[1], RADIUS)
+            print("building network")
+            self._build_road_network()
+            self.last_fetch_position = self.current_position
+
+            with self.data_lock:
+                self.map_matcher = HMMMapMatcher(self.current_road_network)
+
+        if self.fetching_thread is not None and self.fetching_thread.is_alive():
+            return
+        self.fetching_thread = threading.Thread(target=fetch)
+        self.fetching_thread.start()
+
 
     def _build_road_network(self):
-        self.road_network = {}
-        self.index = rtree.index.Index()
+        new_road_network = {}
+        new_index = rtree.index.Index()
         for element in self.prefetched_data['elements']:
             if element['type'] == 'way':
                 way_id = element['id']
-                self.road_network[way_id] = {
+                new_road_network[way_id] = {
                     'nodes': element['nodes'],
                     'tags': element.get('tags', {})
                 }
             elif element['type'] == 'node':
                 node_id = element['id']
                 lat, lon = element['lat'], element['lon']
-                self.index.insert(node_id, (lon, lat, lon, lat))
-                self.road_network[node_id] = {'lat': lat, 'lon': lon}
+                new_index.insert(node_id, (lon, lat, lon, lat))
+                new_road_network[node_id] = {'lat': lat, 'lon': lon}
+
+        with self.data_lock:
+            self.road_network = new_road_network
+            self.index = new_index
+            self.current_road_network = self.road_network
 
     def _map_match(self):
         if len(self.gps_history) < 2:
@@ -86,44 +112,39 @@ class TeToo:
         return list(candidate_roads)
 
     def _get_road_info(self):
-        if not hasattr(self, 'current_way'):
+        if self.current_way is None:
             return None, None
 
-        way_data = self.road_network[self.current_way]
-        road_name = way_data['tags'].get('name', 'Unknown')
-        speed_limit = way_data['tags'].get('maxspeed', 'Unknown')
-        return road_name, speed_limit
+        with self.data_lock:
+            try:
+                way_data = self.current_road_network[self.current_way]
+                road_name = way_data['tags'].get('name', 'Unknown')
+                speed_limit = way_data['tags'].get('maxspeed', 'Unknown')
+                return road_name, speed_limit
+            except KeyError:
+                return 'Unknown', 'Unknown'
 
     def tetoo_thread(self):
         sm = messaging.SubMaster(['liveLocationKalman', 'carState'])
         road_info = {"name": None, "speed_limit": None}
         while True:
             sm.update()
+            self.current_v_ego = sm['carState'].vEgo
+
             location = sm['liveLocationKalman']
             localizer_valid = (location.status == log.LiveLocationKalman.Status.valid) and location.positionGeodetic.valid
 
-            if False: #road_info is not None and sm['carState'].vEgo < 1.3:
+            if self.current_v_ego < 1.3: #road_info is not None and sm['carState'].vEgo < 1.3:
                 pass
             elif localizer_valid:
                 lat = location.positionGeodetic.value[0]
                 lon = location.positionGeodetic.value[1]
-                bearing = location.positionGeodetic.value[2]
+                bearing = math.degrees(location.positionGeodetic.value[2])
 
                 road_name, speed_limit = self.update_position(lat, lon, bearing)
                 road_info = {"name": road_name, "speed_limit": speed_limit}
             print(f"Current road: {road_info['name']}, Speed limit: {road_info['speed_limit']}")
             time.sleep(0.5)
-
-    @staticmethod
-    def _distance(point1: Tuple[float, float], point2: Tuple[float, float]) -> float:
-        # Haversine formula for distance calculation
-        R = 6371000  # Earth radius in meters
-        lat1, lon1 = math.radians(point1[0]), math.radians(point1[1])
-        lat2, lon2 = math.radians(point2[0]), math.radians(point2[1])
-        dlat, dlon = lat2 - lat1, lon2 - lon1
-        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        return R * c
 
 def main():
     tetoo = TeToo()

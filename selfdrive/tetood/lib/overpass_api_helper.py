@@ -32,7 +32,7 @@ class OverpassAPIHelper:
         bbox_angle = np.degrees(radius / R)
         # fetch all ways and nodes on this ways in bbox
         bbox_str = f'{str(lat - bbox_angle)},{str(lon - bbox_angle)},{str(lat + bbox_angle)},{str(lon + bbox_angle)}'
-        lat_lon = "(%f,%f)" % (lat, lon)
+        # lat_lon = "(%f,%f)" % (lat, lon)
         q = """
             [out:json];
             way(""" + bbox_str + """)
@@ -40,11 +40,7 @@ class OverpassAPIHelper:
               [highway!~"^(footway|path|corridor|bridleway|steps|cycleway|construction|bus_guideway|escape|service|track)$"];
             (._;>;);
             out;"""
-        area_q = """is_in""" + lat_lon + """;area._[admin_level~"[24]"];
-            convert area ::id = id(), admin_level = t['admin_level'],
-            name = t['name'], "ISO3166-1:alpha2" = t['ISO3166-1:alpha2'];out;
-            """
-        overpass_query = q+area_q
+        overpass_query = q
         print(overpass_query)
         response = requests.get(self.url, params={'data': overpass_query}, headers=self.headers)
         return response.json()
