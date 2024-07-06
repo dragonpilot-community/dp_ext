@@ -5,6 +5,7 @@ import rtree
 import math
 import json
 import threading
+from collections import deque
 
 import cereal.messaging as messaging
 from cereal import log, custom
@@ -18,6 +19,8 @@ from openpilot.dp_ext.selfdrive.tetood.lib.utils import calculate_bearing, haver
 
 RADIUS = 3500
 
+FREQ = 2 # 250 ms
+
 class TeToo:
     def __init__(self):
         self.current_position = None
@@ -26,7 +29,6 @@ class TeToo:
         self.traffic_signals = {}
         self.speed_cameras = {}
         self.index = rtree.index.Index()
-        self.gps_history = []
         self.map_matcher = None
         self.overpass_helper = None
 
@@ -47,7 +49,19 @@ class TeToo:
         self.current_road_network = None
         self.v_ego = 0.
 
-        self.tw_speed_cameras = TaiwanSpeedCameraLoader().load_speed_cameras()
+        self.gps_history_max_size = 10
+        self.gps_history = deque(maxlen=self.gps_history_max_size)
+
+        self.bearing_history_max_size = 10
+        self.bearing_history = deque(maxlen=self.bearing_history_max_size)
+
+        self._frame = 0
+
+        self._taiwan_speed_camera_enabled = self.params.get_bool("dp_tetoo_data_taiwan_speed_camera")
+        if self._taiwan_speed_camera_enabled:
+            self.tw_speed_cameras = TaiwanSpeedCameraLoader().load_speed_cameras()
+        else:
+            self.tw_speed_cameras = None
 
         self.prefetched_data = None
         self.last_fetch_position = None
@@ -64,17 +78,25 @@ class TeToo:
 
     def update_position(self, lat: float, lon: float, bearing: float):
         new_position = (lat, lon)
+        # e.g. The system being turned off and on again in a different location
         if self.current_position:
             distance_moved = haversine_distance(self.current_position, new_position)
             if distance_moved > 50:  # Reset if we've moved more than 50 meters
                 self.current_way = None
                 self.current_way_confidence = 0
+                self.bearing_history.clear()  # Reset bearing history on large movements
+                self.gps_history.clear()  # Reset GPS history on large movements
 
         self.current_position = new_position
-        self.current_bearing = bearing
+
+        # Update bearing history
+        self.bearing_history.append(bearing)
+
+        # Calculate moving average of bearing
+        self.current_bearing = sum(self.bearing_history) / len(self.bearing_history)
+
         self.gps_history.append((lat, lon))
-        if len(self.gps_history) > 5:  # Keep only last 5 points
-            self.gps_history.pop(0)
+
         self._check_and_fetch_data()
 
         self._map_match()
@@ -123,9 +145,13 @@ class TeToo:
                 new_index.insert(node_id, (lon, lat, lon, lat))
                 new_road_network[node_id] = {'lat': lat, 'lon': lon}
                 if element.get('tags', {}).get('highway') == 'traffic_signals':
-                    self.traffic_signals[int(f"103{node_id}")] = {'lat': lat, 'lon': lon, 'tags': element.get('tags')}
+                    self.traffic_signals[node_id] = {'lat': lat, 'lon': lon, 'tags': element.get('tags')}
                 elif element.get('tags', {}).get('highway') == 'speed_camera':
-                    self.speed_cameras[int(f"102{node_id}")] = {'lat': lat, 'lon': lon, 'tags': element.get('tags')}
+                    self.speed_cameras[node_id] = {'lat': lat, 'lon': lon, 'tags': element.get('tags')}
+
+        # Add traffic signals to the index
+        for node_id, node_data in self.traffic_signals.items():
+            new_index.insert(node_id, (node_data['lon'], node_data['lat'], node_data['lon'], node_data['lat']))
 
         # Load speed cameras
         self.speed_cameras = self.speed_camera_loader.load_speed_cameras(self.prefetched_data)
@@ -135,9 +161,10 @@ class TeToo:
             new_index.insert(camera_id, (camera_data['lon'], camera_data['lat'], camera_data['lon'], camera_data['lat']))
 
         # taiwan specific camera
-        for camera_id, camera_data in self.tw_speed_cameras.items():
-            new_index.insert(camera_id, (camera_data['lon'], camera_data['lat'], camera_data['lon'], camera_data['lat']))
-            self.speed_cameras[camera_id] = camera_data
+        if self._taiwan_speed_camera_enabled:
+            for camera_id, camera_data in self.tw_speed_cameras.items():
+                new_index.insert(camera_id, (camera_data['lon'], camera_data['lat'], camera_data['lon'], camera_data['lat']))
+                self.speed_cameras[camera_id] = camera_data
 
         with self.data_lock:
             self.road_network = new_road_network
@@ -146,6 +173,9 @@ class TeToo:
 
     def _map_match(self):
         if len(self.gps_history) < 2:
+            return
+
+        if self._frame % 2 != 0:
             return
 
         candidate_roads = self._get_candidate_roads(self.gps_history)
@@ -183,14 +213,46 @@ class TeToo:
         return confidence
 
     def _get_candidate_roads(self, gps_points: List[Tuple[float, float]]) -> List[int]:
-        candidate_roads = set()
-        for lat, lon in gps_points:
-            nearby_nodes = list(self.index.nearest((lon, lat, lon, lat), 5))
-            for node in nearby_nodes:
-                for way_id, way_data in self.road_network.items():
-                    if isinstance(way_id, int) and 'nodes' in way_data and node in way_data['nodes']:
-                        candidate_roads.add(way_id)
-        return list(candidate_roads)
+        candidate_roads = []
+        current_lat, current_lon = gps_points[-1]  # Use the most recent GPS point
+
+        nearby_nodes = list(self.index.nearest((current_lon, current_lat, current_lon, current_lat), 5))
+
+        for node in nearby_nodes:
+            for way_id, way_data in self.road_network.items():
+                if isinstance(way_id, int) and 'nodes' in way_data and node in way_data['nodes']:
+                    # Calculate the bearing of the road segment
+                    node_index = way_data['nodes'].index(node)
+                    if node_index < len(way_data['nodes']) - 1:
+                        next_node = way_data['nodes'][node_index + 1]
+                    elif node_index > 0:
+                        next_node = way_data['nodes'][node_index - 1]
+                    else:
+                        continue  # Skip if it's a single-node way
+
+                    node1_lat, node1_lon = self.road_network[node]['lat'], self.road_network[node]['lon']
+                    node2_lat, node2_lon = self.road_network[next_node]['lat'], self.road_network[next_node]['lon']
+
+                    road_bearing = calculate_bearing((node1_lat, node1_lon), (node2_lat, node2_lon))
+
+                    # Calculate the difference between road bearing and vehicle bearing
+                    bearing_diff = abs((road_bearing - self.current_bearing + 180) % 360 - 180)
+
+                    # Calculate distance to the road
+                    distance = haversine_distance((current_lat, current_lon), (node1_lat, node1_lon))
+
+                    # Check if the road name matches the current road name
+                    road_name = way_data.get('tags', {}).get('name')
+                    name_match_bonus = 0
+                    if road_name == self.current_road_name:
+                        name_match_bonus = -10  # Reduce the score for roads with matching names
+
+                    candidate_roads.append((way_id, distance, bearing_diff, name_match_bonus))
+
+        # Sort candidate roads by a combination of distance, bearing difference, and name match
+        candidate_roads.sort(key=lambda x: x[1] + x[2] * 10 + x[3])  # Adjust weights as needed
+
+        return [road[0] for road in candidate_roads[:5]]  # Return top 5 candidates
 
     def _get_road_info(self):
         if self.current_way is None:
@@ -221,7 +283,7 @@ class TeToo:
             'confidence': self.current_way_confidence
         }
 
-    def _check_feature_ahead(self, feature_dict: Dict, max_distance: float) -> Tuple[bool, float, Dict, str]:
+    def _check_feature_ahead(self, feature_type: str, max_distance: float) -> Tuple[bool, float, Dict, str]:
         if self.current_position is None or self.current_bearing is None:
             return False, float('inf'), {}, ""
 
@@ -230,12 +292,34 @@ class TeToo:
         closest_feature_info = {}
         closest_feature_id = ""
 
-        for feature_id, feature_data in feature_dict.items():
+        # Define a bounding box for the spatial query
+        search_distance = max_distance / 111000  # Convert meters to degrees (approximate)
+        bbox = (
+            current_lon - search_distance,
+            current_lat - search_distance,
+            current_lon + search_distance,
+            current_lat + search_distance
+        )
+
+        # Query the rtree index for nearby features
+        nearby_features = list(self.index.intersection(bbox))
+
+        for feature_id in nearby_features:
+            # Check if this feature is of the correct type
+            if feature_type == custom.TeToo.FeatureType.trafficSignal and feature_id not in self.traffic_signals:
+                continue
+            if feature_type == custom.TeToo.FeatureType.speedCamera and feature_id not in self.speed_cameras:
+                continue
+
+            feature_data = self.traffic_signals.get(feature_id) or self.speed_cameras.get(feature_id)
+            if not feature_data:
+                continue
+
             feature_lat, feature_lon = feature_data['lat'], feature_data['lon']
 
             distance = haversine_distance((current_lat, current_lon), (feature_lat, feature_lon))
 
-            # # Skip features beyond the maximum look-ahead distance
+            # Skip features beyond the maximum look-ahead distance
             if distance > max_distance:
                 continue
 
@@ -250,11 +334,11 @@ class TeToo:
 
     def check_traffic_signal_ahead(self) -> Tuple[bool, float, Dict, str]:
         MAX_TRAFFIC_SIGNAL_DISTANCE = 250  # meters
-        return self._check_feature_ahead(self.traffic_signals, MAX_TRAFFIC_SIGNAL_DISTANCE)
+        return self._check_feature_ahead(custom.TeToo.FeatureType.trafficSignal, MAX_TRAFFIC_SIGNAL_DISTANCE)
 
     def check_speed_camera_ahead(self) -> Tuple[bool, float, Dict, str]:
         MAX_SPEED_CAMERA_DISTANCE = 1000  # meters
-        return self._check_feature_ahead(self.speed_cameras, MAX_SPEED_CAMERA_DISTANCE)
+        return self._check_feature_ahead(custom.TeToo.FeatureType.speedCamera, MAX_SPEED_CAMERA_DISTANCE)
 
     def _get_feature(self, type, lat, lon, func, display_tags=False):
         ahead, distance, info, id = func()
@@ -299,10 +383,10 @@ class TeToo:
 
                 dat.teToo.lat = float(lat)
                 dat.teToo.lon = float(lon)
-                dat.teToo.bearing = float(bearing)
+                dat.teToo.bearing = float(self.current_bearing) if self.current_bearing is not None else 0.  # Use the moving average bearing
 
                 road_info = self.update_position(lat, lon, bearing)
-                dat.teToo.name = str(road_info['name'])
+                dat.teToo.name = str("" if road_info['name'] is None else road_info['name'])
                 dat.teToo.maxspeed = float(road_info['maxspeed'])
                 # keep it for future
                 # dat.teToo.tags = json.dumps(road_info['tags'], ensure_ascii=False)
@@ -316,10 +400,13 @@ class TeToo:
                     features.append(speed_camera_ahead)
                 dat.teToo.nearestFeatures = features
 
+            self._frame += 1
+
             dat.teToo.updatingData = self.fetching_thread is not None and self.fetching_thread.is_alive()
             pm.send('teToo', dat)
+            # print(dat)
             te_too_dat_prev = dat.teToo
-            time.sleep(0.2)
+            time.sleep(1/FREQ)
 
 def main():
     tetoo = TeToo()
