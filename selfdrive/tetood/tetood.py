@@ -184,14 +184,12 @@ class TeToo:
                 force_match = True
 
         if force_match or self._frame % 2 == 0:
-            candidate_roads = self._get_candidate_roads(self.gps_history)
-            if not candidate_roads:
-                return
-
             if self.map_matcher is None:
                 return
 
-            matched_way = self.map_matcher.match(self.gps_history, candidate_roads)
+            # Use the entire GPS history for matching
+            matched_way = self.map_matcher.match(self.gps_history)
+
             if matched_way is not None:
                 self.current_way = matched_way
                 self.last_matched_bearing = self.current_bearing  # Update last matched bearing

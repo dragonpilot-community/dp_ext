@@ -1,11 +1,23 @@
 import numpy as np
 from typing import List, Tuple, Dict
+from rtree import index
 
 class HMMMapMatcher:
     def __init__(self, road_network: Dict):
         self.road_network = road_network
+        self.spatial_index = self._build_spatial_index()
 
-    def match(self, gps_history: List[Tuple[float, float]], candidate_roads: List[int]) -> int:
+    def _build_spatial_index(self):
+        idx = index.Index()
+        for way_id, way_data in self.road_network.items():
+            if isinstance(way_id, int) and 'nodes' in way_data:
+                for node in way_data['nodes']:
+                    node_data = self.road_network[node]
+                    idx.insert(way_id, (node_data['lon'], node_data['lat'], node_data['lon'], node_data['lat']))
+        return idx
+
+    def match(self, gps_history: List[Tuple[float, float]]) -> int:
+        candidate_roads = self._get_candidate_roads(gps_history)
         num_states = len(candidate_roads)
         num_observations = len(gps_history)
 
@@ -31,6 +43,13 @@ class HMMMapMatcher:
         best_path.reverse()
 
         return candidate_roads[best_path[-1]]
+
+    def _get_candidate_roads(self, gps_points: List[Tuple[float, float]]) -> List[int]:
+        candidate_roads = set()
+        for lat, lon in gps_points:
+            nearby_roads = list(self.spatial_index.nearest((lon, lat, lon, lat), 5))
+            candidate_roads.update(nearby_roads)
+        return list(candidate_roads)
 
     def _calculate_emission_probabilities(self, gps_points, candidate_roads):
         emission_probs = np.zeros((len(candidate_roads), len(gps_points)))
@@ -65,4 +84,3 @@ class HMMMapMatcher:
         numerator = abs((y2-y1)*px - (x2-x1)*py + x2*y1 - y2*x1)
         denominator = ((y2-y1)**2 + (x2-x1)**2)**0.5
         return numerator / denominator if denominator != 0 else float('inf')
-
