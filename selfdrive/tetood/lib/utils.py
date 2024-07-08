@@ -30,9 +30,33 @@ def calculate_bearing(point1: Tuple[float, float], point2: Tuple[float, float]) 
     return bearing
 
 
-def feature_is_ahead(current_bearing, bearing_to_feature, within_deg=30.):
+def angle_diff(b1, b2):
     # Calculate the absolute angle difference
-    angle_diff = abs((bearing_to_feature - current_bearing + 180) % 360 - 180)
+    return abs((b1 - b2 + 180) % 360 - 180)
 
+def feature_is_ahead(current_bearing, bearing_to_feature, within_deg=15.):
     # Consider features within a 60-degree cone in front of the vehicle
-    return angle_diff <= within_deg
+    return angle_diff(current_bearing, bearing_to_feature) <= within_deg
+
+
+def calculate_predicted_position(point: Tuple[float, float], bearing: float, distance: float) -> Tuple[float, float]:
+    # Convert bearing to radians
+    bearing_rad = math.radians(bearing)
+
+    # Convert lat and lon from degrees to radians
+    lat_rad = math.radians(point[0])
+    lon_rad = math.radians(point[1])
+
+    # Calculate the new latitude
+    new_lat_rad = math.asin(math.sin(lat_rad) * math.cos(distance / R) +
+                            math.cos(lat_rad) * math.sin(distance / R) * math.cos(bearing_rad))
+
+    # Calculate the new longitude
+    new_lon_rad = lon_rad + math.atan2(math.sin(bearing_rad) * math.sin(distance / R) * math.cos(lat_rad),
+                                       math.cos(distance / R) - math.sin(lat_rad) * math.sin(new_lat_rad))
+
+    # Convert the new latitude and longitude from radians to degrees
+    new_lat = math.degrees(new_lat_rad)
+    new_lon = math.degrees(new_lon_rad)
+
+    return new_lat, new_lon
