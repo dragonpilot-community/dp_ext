@@ -8,6 +8,7 @@ class HMMMapMatcher:
         self.spatial_index = self._build_spatial_index()
 
     def _build_spatial_index(self):
+        """Creates an R-tree spatial index of the road network, this allows for fast querying of nearby roads."""
         idx = index.Index()
         for way_id, way_data in self.road_network.items():
             if isinstance(way_id, int) and 'nodes' in way_data:
@@ -17,6 +18,7 @@ class HMMMapMatcher:
         return idx
 
     def match(self, gps_history: List[Tuple[float, float]]) -> int:
+        """Takes a list of GPS points and returns the ID of the most likely road, implements the Viterbi algorithm to find the most probable sequence of roads."""
         candidate_roads = self._get_candidate_roads(gps_history)
         num_states = len(candidate_roads)
         num_observations = len(gps_history)
@@ -45,6 +47,7 @@ class HMMMapMatcher:
         return candidate_roads[best_path[-1]]
 
     def _get_candidate_roads(self, gps_points: List[Tuple[float, float]]) -> List[int]:
+        """Finds potential road candidates for each GPS point using the spatial index, returns a list of unique road IDs that are near any of the GPS points."""
         candidate_roads = set()
         for lat, lon in gps_points:
             nearby_roads = list(self.spatial_index.nearest((lon, lat, lon, lat), 5))
@@ -60,6 +63,7 @@ class HMMMapMatcher:
         return emission_probs / emission_probs.sum(axis=0)
 
     def _calculate_transition_probabilities(self, candidate_roads):
+        """Computes the probability of transitioning from one road to another, currently uses a simple model with high probability of staying on the same road."""
         num_roads = len(candidate_roads)
         transition_probs = np.zeros((num_roads, num_roads))
         for i in range(num_roads):
@@ -71,6 +75,7 @@ class HMMMapMatcher:
         return transition_probs
 
     def _perpendicular_distance(self, lat, lon, road_nodes):
+        """Calculates the minimum perpendicular distance from a point to a road, iterates through road segments to find the closest one."""
         min_distance = float('inf')
         for i in range(len(road_nodes) - 1):
             node1 = self.road_network[road_nodes[i]]
@@ -81,6 +86,7 @@ class HMMMapMatcher:
 
     @staticmethod
     def _point_to_line_distance(px, py, x1, y1, x2, y2):
+        """Calculates the perpendicular distance from a point to a line segment,"""
         numerator = abs((y2-y1)*px - (x2-x1)*py + x2*y1 - y2*x1)
         denominator = ((y2-y1)**2 + (x2-x1)**2)**0.5
         return numerator / denominator if denominator != 0 else float('inf')
