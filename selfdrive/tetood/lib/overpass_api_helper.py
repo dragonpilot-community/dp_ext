@@ -1,6 +1,7 @@
 
 import requests
 import numpy as np
+from openpilot.dp_ext.selfdrive.tetood.lib.utils import R
 
 class OverpassAPIHelper:
     def __init__(self):
@@ -9,7 +10,6 @@ class OverpassAPIHelper:
         self.headers = {'Accept-Encoding': 'gzip'}
 
     def fetch_data(self, lat, lon, radius=3500, high_speed=True):
-        R = 6373000.0  # approximate radius of earth in mts
         """Fetch data from Overpass API based on the given GPS coordinates."""
         bbox_angle = np.degrees(radius / R)
         # fetch all ways and nodes on this ways in bbox
@@ -32,5 +32,8 @@ class OverpassAPIHelper:
         out body;
         """
         # print(overpass_query)
-        response = requests.get(self.url, params={'data': overpass_query}, headers=self.headers)
+        try:
+          response = requests.get(self.url, params={'data': overpass_query}, headers=self.headers)
+        except:
+          return None
         return response.json()
