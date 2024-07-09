@@ -59,7 +59,7 @@ class HMMMapMatcher:
         for i, road in enumerate(candidate_roads):
             for j, (lat, lon) in enumerate(gps_points):
                 distance = self._perpendicular_distance(lat, lon, self.road_network[road]['nodes'])
-                emission_probs[i, j] = np.exp(-distance / 20)  # 20 meters as standard deviation
+                emission_probs[i, j] = np.exp(-distance / 5.)  # 5 meters as standard deviation
         return emission_probs / emission_probs.sum(axis=0)
 
     def _calculate_transition_probabilities(self, candidate_roads):
