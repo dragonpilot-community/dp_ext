@@ -191,58 +191,6 @@ class TeToo:
 
         self._frame += 1
 
-    def _get_candidate_roads(self, gps_points: List[Tuple[float, float]]) -> List[int]:
-        candidate_roads = []
-        current_lat, current_lon = gps_points[-1]  # Use the most recent GPS point
-
-        nearby_nodes = list(self.index.nearest((current_lon, current_lat, current_lon, current_lat), 5))
-
-        # Calculate bearing change
-        bearing_change = 0
-        if len(self.bearing_history) >= 2:
-            recent_bearing = self.bearing_history[-1]
-            previous_bearing = self.bearing_history[-2]
-            bearing_change = angle_diff(recent_bearing, previous_bearing)
-
-        # Adjust bearing weight based on bearing change
-        bearing_weight = 20 if bearing_change > self.bearing_change_threshold else 10
-
-        for node in nearby_nodes:
-            for way_id, way_data in self.road_network.items():
-                if isinstance(way_id, int) and 'nodes' in way_data and node in way_data['nodes']:
-                    # Calculate the bearing of the road segment
-                    node_index = way_data['nodes'].index(node)
-                    if node_index < len(way_data['nodes']) - 1:
-                        next_node = way_data['nodes'][node_index + 1]
-                    elif node_index > 0:
-                        next_node = way_data['nodes'][node_index - 1]
-                    else:
-                        continue  # Skip if it's a single-node way
-
-                    node1_lat, node1_lon = self.road_network[node]['lat'], self.road_network[node]['lon']
-                    node2_lat, node2_lon = self.road_network[next_node]['lat'], self.road_network[next_node]['lon']
-
-                    road_bearing = calculate_bearing((node1_lat, node1_lon), (node2_lat, node2_lon))
-
-                    # Calculate the difference between road bearing and vehicle bearing
-                    bearing_diff = angle_diff(road_bearing, self.current_bearing)
-
-                    # Calculate distance to the road
-                    distance = haversine_distance((current_lat, current_lon), (node1_lat, node1_lon))
-
-                    # Check if the road name matches the current road name
-                    road_name = way_data.get('tags', {}).get('name')
-                    name_match_bonus = 0
-                    if road_name == self.current_road_name:
-                        name_match_bonus = -0  # Reduce the score for roads with matching names
-
-                    candidate_roads.append((way_id, distance, bearing_diff, name_match_bonus))
-
-        # Sort candidate roads by a combination of distance, bearing difference, and name match
-        candidate_roads.sort(key=lambda x: x[1] + x[2] * bearing_weight + x[3])  # Adjusted bearing weight
-
-        return [road[0] for road in candidate_roads[:5]]  # Return top 5 candidates
-
     def _get_road_info(self):
         if self.current_way is None:
             return {
