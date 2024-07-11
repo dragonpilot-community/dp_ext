@@ -49,7 +49,7 @@ class HMMMapMatcher:
     def _get_candidate_roads(self, gps_points: List[Tuple[float, float]]) -> List[int]:
         """Finds potential road candidates for each GPS point using the spatial index, returns a list of unique road IDs that are near any of the GPS points."""
         candidate_roads = set()
-        for lat, lon in gps_points:
+        for lat, lon, bearing, speed in gps_points:
             nearby_roads = list(self.spatial_index.nearest((lon, lat, lon, lat), 5))
             candidate_roads.update(nearby_roads)
         return list(candidate_roads)
@@ -57,7 +57,7 @@ class HMMMapMatcher:
     def _calculate_emission_probabilities(self, gps_points, candidate_roads):
         emission_probs = np.zeros((len(candidate_roads), len(gps_points)))
         for i, road in enumerate(candidate_roads):
-            for j, (lat, lon) in enumerate(gps_points):
+            for j, (lat, lon, bearing, speed) in enumerate(gps_points):
                 distance = self._perpendicular_distance(lat, lon, self.road_network[road]['nodes'])
                 emission_probs[i, j] = np.exp(-distance / 5.)  # 5 meters as standard deviation
         return emission_probs / emission_probs.sum(axis=0)

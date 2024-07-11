@@ -60,3 +60,8 @@ def calculate_predicted_position(point: Tuple[float, float], bearing: float, dis
     new_lon = math.degrees(new_lon_rad)
 
     return new_lat, new_lon
+
+def point_to_line_distance(px, py, x1, y1, x2, y2):
+    numerator = abs((y2-y1)*px - (x2-x1)*py + x2*y1 - y2*x1)
+    denominator = ((y2-y1)**2 + (x2-x1)**2)**0.5
+    return numerator / denominator if denominator != 0 else float('inf')
