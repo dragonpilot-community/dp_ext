@@ -1,8 +1,9 @@
 import math
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Deque
 from rtree import index
 import logging
 from functools import lru_cache
+from collections import deque
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -89,6 +90,8 @@ class MapMatcher:
         self.ways = self._load_ways(road_network)
         self.rtree = self._build_rtree()
         self.current_way = None
+        self.position_history = deque(maxlen=5)  # Store last 5 positions
+        self.way_history = deque(maxlen=5)  # Store last 5 matched ways
 
     def _load_ways(self, road_network: Dict) -> Dict[int, Way]:
         ways = {}
@@ -111,35 +114,80 @@ class MapMatcher:
         logger.info("R-tree index built")
         return idx
 
-    def update_position(self, pos: Position) -> Optional[CurrentWay]:
-        logger.debug(f"Updating position: lat={pos.lat}, lon={pos.lon}, bearing={pos.bearing}, speed={pos.speed}")
-
+    def _get_nearby_ways(self, pos: Position) -> List[Way]:
         lat_change = SEARCH_RADIUS / (EARTH_RADIUS * TO_RADIANS)
         lon_change = SEARCH_RADIUS / (EARTH_RADIUS * TO_RADIANS * math.cos(math.radians(pos.lat)))
 
         search_bbox = (pos.lon - lon_change, pos.lat - lat_change,
                        pos.lon + lon_change, pos.lat + lat_change)
 
-        logger.debug(f"Search bbox: {search_bbox}")
+        nearby_way_ids = list(self.rtree.intersection(search_bbox))
+        return [self.ways[way_id] for way_id in nearby_way_ids if way_id in self.ways]
 
-        nearby_ways = list(self.rtree.intersection(search_bbox))
-        logger.debug(f"Found {len(nearby_ways)} nearby ways")
-
-        best_match = None
-        best_distance = float('inf')
-
-        for way_id in nearby_ways:
-            way = self.ways.get(way_id)
-            if way is None:
-                continue
+    def _get_candidate_ways(self, nearby_ways: List[Way], pos: Position) -> List[Tuple[Way, OnWayResult]]:
+        candidates = []
+        for way in nearby_ways:
             on_way_result = self.on_way(way, pos)
-            if on_way_result.on_way and on_way_result.distance < best_distance:
-                best_match = (way, on_way_result)
-                best_distance = on_way_result.distance
+            if on_way_result.on_way:
+                candidates.append((way, on_way_result))
+        return candidates
+
+    def _select_best_match(self, candidates: List[Tuple[Way, OnWayResult]], pos: Position) -> Optional[Tuple[Way, OnWayResult]]:
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # We're at an intersection or parallel roads, need to decide which way to choose
+        scored_candidates = [(way, on_way_result, self._score_candidate(way, on_way_result, pos))
+                             for way, on_way_result in candidates]
+
+        best_match = max(scored_candidates, key=lambda x: x[2])
+        return (best_match[0], best_match[1])
+
+    def _score_candidate(self, way: Way, on_way_result: OnWayResult, pos: Position) -> float:
+        score = 100 - on_way_result.distance  # Base score on distance (closer is better)
+
+        # Prefer continuing on the same road
+        if self.current_way and way.id == self.current_way.way.id:
+            score += 50
+
+        # Consider trajectory
+        if len(self.position_history) >= 2:
+            prev_pos = self.position_history[-1]
+            expected_bearing = self._calculate_bearing(
+                Coordinates(prev_pos.lat, prev_pos.lon),
+                Coordinates(pos.lat, pos.lon)
+            )
+            bearing_diff = abs(expected_bearing - pos.bearing)
+            score -= min(bearing_diff, 360 - bearing_diff)  # Penalize based on bearing difference
+
+        # Consider speed
+        if pos.speed < 5:  # If nearly stopped, we're less certain
+            score -= 20
+
+        # Consider historical matches
+        if way in self.way_history:
+            score += 30
+
+        return score
+
+    def update_position(self, pos: Position) -> Optional[CurrentWay]:
+        logger.debug(f"Updating position: lat={pos.lat}, lon={pos.lon}, bearing={pos.bearing}, speed={pos.speed}")
+
+        nearby_ways = self._get_nearby_ways(pos)
+
+        candidate_ways = self._get_candidate_ways(nearby_ways, pos)
+
+        best_match = self._select_best_match(candidate_ways, pos)
 
         if best_match:
-            logger.info(f"Matched to way: {best_match[0].id}")
-            return self._update_current_way(pos, best_match[0], best_match[1])
+            way, on_way_result = best_match
+            logger.info(f"Matched to way: {way.id}")
+            self.position_history.append(pos)
+            self.way_history.append(way)
+            return self._update_current_way(pos, way, on_way_result)
 
         logger.warning("No matching way found")
         return None
