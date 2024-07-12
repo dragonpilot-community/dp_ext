@@ -34,7 +34,7 @@ class Position:
         self.lat = lat
         self.lon = lon
         self.bearing = bearing
-        self.speed = speed
+        self.speed = speed  # Speed in meters per second
         self.turn_signal = turn_signal  # 'left', 'right', or None
 
 class Way:
@@ -118,6 +118,7 @@ class MapMatcher:
         self.last_switch_time = 0
         self.switch_cooldown = 5  # Seconds to wait before allowing another switch
         self.current_layer = 0
+        self.way_bearings = {}  # Cache for way bearings
 
     def _load_ways(self, road_network: Dict) -> Dict[int, Way]:
         ways = {}
@@ -148,7 +149,7 @@ class MapMatcher:
                        pos.lon + lon_change, pos.lat + lat_change)
 
         nearby_way_ids = list(self.rtree.intersection(search_bbox))
-        return [self.ways[way_id] for way_id in nearby_way_ids if way_id in self.ways]
+        return [self.ways[way_id] for way_id in nearby_way_ids]
 
     def _get_candidate_ways(self, nearby_ways: List[Way], pos: Position) -> List[Tuple[Way, OnWayResult]]:
         candidates = []
@@ -204,11 +205,8 @@ class MapMatcher:
             bearing_diff = abs(expected_bearing - pos.bearing)
             score -= min(bearing_diff, 360 - bearing_diff)  # Penalize based on bearing difference
 
-        # Consider speed
-        if pos.speed < 5:  # If nearly stopped, we're less certain
-            score -= 20
-        elif pos.speed > 30:  # If moving fast, more likely to stay on the same road
-            score += 20
+        # Speed is in m/s, so 8.33 m/s is about 30 km/h, and 1.39 m/s is about 5 km/h
+        score += 20 if pos.speed > 8.33 else (-20 if pos.speed < 1.39 else 0)
 
         # Consider historical matches
         if way in self.way_history:
@@ -293,30 +291,22 @@ class MapMatcher:
         return None
 
     def on_way(self, way: Way, pos: Position) -> OnWayResult:
-        logger.debug(f"Checking if on way: {way.id} - {way.name}")
-        distance = self._distance_to_way(pos, way)
-        logger.debug(f"Distance to way: {distance:.2f} meters")
+        distance = self._distance_to_way(pos.lat, pos.lon, way.id)
 
-        lanes = way.lanes
-        road_width_estimate = lanes * LANE_WIDTH
-        max_dist = 5 + road_width_estimate
-        logger.debug(f"Max allowed distance: {max_dist:.2f} meters")
+        max_dist = 5 + way.lanes * LANE_WIDTH
 
         if distance < max_dist:
-            is_forward = self._is_forward(way.nodes[0], way.nodes[-1], pos.bearing)
-            logger.debug(f"Is forward: {is_forward}")
+            is_forward = self._is_forward(way.id, pos.bearing)
             if not is_forward and way.oneway:
-                logger.debug("Not on way: wrong direction on one-way road")
                 return OnWayResult(False, distance, is_forward)
-            logger.debug("On way: within max distance")
             return OnWayResult(True, distance, is_forward)
 
-        logger.debug("Not on way: outside max distance")
         return OnWayResult(False, distance, False)
 
-
-    def _distance_to_way(self, pos: Position, way: Way) -> float:
-        return min(self._point_to_line_distance(pos.lat, pos.lon, start.lat, start.lon, end.lat, end.lon)
+    @lru_cache(maxsize=1024)
+    def _distance_to_way(self, pos_lat: float, pos_lon: float, way_id: int) -> float:
+        way = self.ways[way_id]
+        return min(self._point_to_line_distance(pos_lat, pos_lon, start.lat, start.lon, end.lat, end.lon)
                    for start, end in zip(way.nodes, way.nodes[1:]))
 
     @staticmethod
@@ -348,11 +338,16 @@ class MapMatcher:
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return EARTH_RADIUS * c
 
-    @staticmethod
-    def _is_forward(start: Coordinates, end: Coordinates, bearing: float) -> bool:
-        way_bearing = MapMatcher._calculate_bearing(start, end)
+    def _is_forward(self, way_id: int, bearing: float) -> bool:
+        if way_id not in self.way_bearings:
+            way = self.ways[way_id]
+            self.way_bearings[way_id] = self._calculate_bearing(way.nodes[0], way.nodes[-1])
+
+        way_bearing = self.way_bearings[way_id]
         bearing_diff = abs(way_bearing - bearing)
-        return bearing_diff < 90 or bearing_diff > 270
+        is_forward = bearing_diff < 90 or bearing_diff > 270
+        logger.debug(f"Way {way_id}: bearing {way_bearing}, vehicle bearing {bearing}, is_forward: {is_forward}")
+        return is_forward
 
     @staticmethod
     @lru_cache(maxsize=1024)
