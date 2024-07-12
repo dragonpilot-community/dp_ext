@@ -30,11 +30,11 @@ def calculate_bearing(point1: Tuple[float, float], point2: Tuple[float, float]) 
     return bearing
 
 
-def angle_diff(b1, b2):
+def angle_diff(bearing1: float, bearing2 :float) -> float:
     # Calculate the absolute angle difference
-    return abs((b1 - b2 + 180) % 360 - 180)
+    return abs((bearing1 - bearing2 + 180) % 360 - 180)
 
-def feature_is_ahead(current_bearing, bearing_to_feature, within_deg=15.):
+def feature_is_ahead(current_bearing: float, bearing_to_feature: float, within_deg: float = 15.):
     # Consider features within a 60-degree cone in front of the vehicle
     return angle_diff(current_bearing, bearing_to_feature) <= within_deg
 

@@ -17,7 +17,7 @@ from openpilot.system.hardware import PC
 from openpilot.dp_ext.selfdrive.tetood.lib.map_matcher import MapMatcher, Position
 from openpilot.dp_ext.selfdrive.tetood.lib.overpass_api_helper import OverpassAPIHelper
 from openpilot.dp_ext.selfdrive.tetood.lib.taiwan_speed_camera_loader import TaiwanSpeedCameraLoader
-from openpilot.dp_ext.selfdrive.tetood.lib.utils import calculate_bearing, haversine_distance, feature_is_ahead, calculate_predicted_position
+from openpilot.dp_ext.selfdrive.tetood.lib.utils import calculate_bearing, haversine_distance, feature_is_ahead
 
 RADIUS = 3500
 
