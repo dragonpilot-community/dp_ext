@@ -15,8 +15,8 @@ EARTH_RADIUS = 6371000  # Earth radius in meters
 PADDING = 100  # meters
 LANE_WIDTH = 3.7  # meters
 MIN_WAY_DIST = 500  # meters
-MAX_DISTANCE = 50  # meters, maximum distance to consider a way as matching
-SEARCH_RADIUS = 100  # meters
+MAX_DISTANCE = 25  # meters, maximum distance to consider a way as matching
+SEARCH_RADIUS = 50  # meters
 
 class Coordinates:
     def __init__(self, lat: float, lon: float):
@@ -30,11 +30,12 @@ class Coordinates:
         return hash((self.lat, self.lon))
 
 class Position:
-    def __init__(self, lat: float, lon: float, bearing: float, speed: float):
+    def __init__(self, lat: float, lon: float, bearing: float, speed: float, turn_signal: Optional[str] = None):
         self.lat = lat
         self.lon = lon
         self.bearing = bearing
         self.speed = speed
+        self.turn_signal = turn_signal  # 'left', 'right', or None
 
 class Way:
     def __init__(self, id: int, nodes: List[Coordinates], tags: Dict[str, str]):
@@ -90,8 +91,10 @@ class MapMatcher:
         self.ways = self._load_ways(road_network)
         self.rtree = self._build_rtree()
         self.current_way = None
-        self.position_history = deque(maxlen=5)  # Store last 5 positions
-        self.way_history = deque(maxlen=5)  # Store last 5 matched ways
+        self.position_history = deque(maxlen=10)  # Increased history
+        self.way_history = deque(maxlen=10)  # Increased history
+        self.last_switch_time = 0
+        self.switch_cooldown = 5  # Seconds to wait before allowing another switch
 
     def _load_ways(self, road_network: Dict) -> Dict[int, Way]:
         ways = {}
@@ -132,19 +135,34 @@ class MapMatcher:
                 candidates.append((way, on_way_result))
         return candidates
 
-    def _select_best_match(self, candidates: List[Tuple[Way, OnWayResult]], pos: Position) -> Optional[Tuple[Way, OnWayResult]]:
+    def _select_best_match(self, candidates: List[Tuple[Way, OnWayResult]], pos: Position, timestamp: float) -> Optional[Tuple[Way, OnWayResult]]:
         if not candidates:
             return None
 
         if len(candidates) == 1:
             return candidates[0]
 
-        # We're at an intersection or parallel roads, need to decide which way to choose
         scored_candidates = [(way, on_way_result, self._score_candidate(way, on_way_result, pos))
                              for way, on_way_result in candidates]
 
         best_match = max(scored_candidates, key=lambda x: x[2])
-        return (best_match[0], best_match[1])
+        best_way, best_on_way_result, best_score = best_match
+
+        # Implement snapping logic
+        if self.current_way and self.current_way.way.id != best_way.id:
+            time_since_last_switch = timestamp - self.last_switch_time
+            if time_since_last_switch < self.switch_cooldown:
+                # If we recently switched, prefer staying on the current way
+                current_way_candidate = next((c for c in scored_candidates if c[0].id == self.current_way.way.id), None)
+                if current_way_candidate:
+                    current_way, current_on_way_result, current_score = current_way_candidate
+                    if current_score > best_score * 0.8:  # Allow some tolerance
+                        return (current_way, current_on_way_result)
+            else:
+                # If enough time has passed, allow switching and update the last switch time
+                self.last_switch_time = timestamp
+
+        return (best_way, best_on_way_result)
 
     def _score_candidate(self, way: Way, on_way_result: OnWayResult, pos: Position) -> float:
         score = 100 - on_way_result.distance  # Base score on distance (closer is better)
@@ -166,21 +184,57 @@ class MapMatcher:
         # Consider speed
         if pos.speed < 5:  # If nearly stopped, we're less certain
             score -= 20
+        elif pos.speed > 30:  # If moving fast, more likely to stay on the same road
+            score += 20
 
         # Consider historical matches
         if way in self.way_history:
             score += 30
 
+        # Consider turn signals
+        if pos.turn_signal:
+            way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
+            if pos.turn_signal == 'left' and way_bearing < pos.bearing:
+                score += 40
+            elif pos.turn_signal == 'right' and way_bearing > pos.bearing:
+                score += 40
+
+        # Consider lane changes
+        if self.current_way and way.id != self.current_way.way.id:
+            parallel_score = self._score_parallel_ways(self.current_way.way, way)
+            score += parallel_score
+
         return score
 
-    def update_position(self, pos: Position) -> Optional[CurrentWay]:
-        logger.debug(f"Updating position: lat={pos.lat}, lon={pos.lon}, bearing={pos.bearing}, speed={pos.speed}")
+    def _score_parallel_ways(self, current_way: Way, candidate_way: Way) -> float:
+        # Check if ways are roughly parallel and close to each other
+        if len(current_way.nodes) < 2 or len(candidate_way.nodes) < 2:
+            return 0
+
+        current_bearing = self._calculate_bearing(current_way.nodes[0], current_way.nodes[-1])
+        candidate_bearing = self._calculate_bearing(candidate_way.nodes[0], candidate_way.nodes[-1])
+
+        bearing_diff = abs(current_bearing - candidate_bearing)
+        if bearing_diff > 20 and bearing_diff < 340:  # Not parallel
+            return 0
+
+        # Check distance between ways
+        min_distance = min(self._point_to_line_distance(node.lat, node.lon,
+                                                        candidate_way.nodes[0].lat, candidate_way.nodes[0].lon,
+                                                        candidate_way.nodes[-1].lat, candidate_way.nodes[-1].lon)
+                           for node in current_way.nodes)
+
+        if 5 < min_distance < 20:  # Typical lane width range
+            return 30  # Boost score for potential lane change
+
+        return 0
+
+    def update_position(self, pos: Position, timestamp: float) -> Optional[CurrentWay]:
+        logger.debug(f"Updating position: lat={pos.lat}, lon={pos.lon}, bearing={pos.bearing}, speed={pos.speed}, turn_signal={pos.turn_signal}")
 
         nearby_ways = self._get_nearby_ways(pos)
-
         candidate_ways = self._get_candidate_ways(nearby_ways, pos)
-
-        best_match = self._select_best_match(candidate_ways, pos)
+        best_match = self._select_best_match(candidate_ways, pos, timestamp)
 
         if best_match:
             way, on_way_result = best_match
