@@ -5,18 +5,25 @@ import math
 import json
 import threading
 from collections import deque
+import time
 
 import cereal.messaging as messaging
 from cereal import log, custom
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
+from openpilot.common.conversions import Conversions as CV
+from openpilot.system.hardware import PC
 
-from openpilot.dp_ext.selfdrive.tetood.lib.hmm_map_matcher import HMMMapMatcher
+from openpilot.dp_ext.selfdrive.tetood.lib.map_matcher import MapMatcher, Position
 from openpilot.dp_ext.selfdrive.tetood.lib.overpass_api_helper import OverpassAPIHelper
 from openpilot.dp_ext.selfdrive.tetood.lib.taiwan_speed_camera_loader import TaiwanSpeedCameraLoader
-from openpilot.dp_ext.selfdrive.tetood.lib.utils import calculate_bearing, haversine_distance, feature_is_ahead, angle_diff, calculate_predicted_position
+from openpilot.dp_ext.selfdrive.tetood.lib.utils import calculate_bearing, haversine_distance, feature_is_ahead
 
 RADIUS = 3500
+
+FREQ = 5 # hz
+
+DEBUG = True
 
 class TeToo:
     def __init__(self):
@@ -39,20 +46,17 @@ class TeToo:
 
         self.fetching_thread = None
         self.data_lock = threading.Lock()
-        self.current_road_network = None
+
         self.v_ego = 0.
+        self.v_cruise = 0.
+        self.cruise_enabled = False
 
-        self.gps_history = deque(maxlen=100)
+        self.gps_history = deque(maxlen=1*FREQ)
+        self.bearing_history = deque(maxlen=1*FREQ)
 
-        self.bearing_history = deque(maxlen=60)
-
-        self._frame = 0
-
-        self.last_matched_bearing = None
-        self.bearing_change_threshold = 45  # degrees
-
-        self._osm = self.params.get_bool("dp_tetoo")
-        self._taiwan_speed_camera_enabled = self.params.get_bool("dp_tetoo_taiwan_speed_camera")
+        self._osm = True if PC else self.params.get_bool("dp_tetoo")
+        self._taiwan_speed_camera_enabled = True if PC else self.params.get_bool("dp_tetoo_speed_camera_taiwan")
+        self._speed_camera_threshold = int(self.params.get_bool("dp_tetoo_speed_camera_threshold")) * 0.01
 
         self.osm_speed_cameras = {}
         self.tw_speed_cameras = {}
@@ -69,25 +73,14 @@ class TeToo:
             last_data = self.params.get("dp_tetoo_data")
             if last_data is not None and last_data != "":
                 self.prefetched_data = json.loads(last_data)
+                self.map_matcher = MapMatcher(self.prefetched_data)
                 self._build_road_network()
-                self.map_matcher = HMMMapMatcher(self.current_road_network)
 
                 last_pos = self.params.get("dp_tetoo_gps")
                 if last_pos is not None and last_pos != "":
                     self.last_fetch_position = json.loads(last_pos)
 
-    def update_position(self, lat: float, lon: float):
-        new_position = (lat, lon)
-        # e.g. The system being turned off and on again in a different location
-        if self.current_position:
-            distance_moved = haversine_distance(self.current_position, new_position)
-            if distance_moved > 50:  # Reset if we've moved more than 50 meters
-                self.current_way = None
-                self.bearing_history.clear()  # Reset bearing history on large movements
-                self.gps_history.clear()  # Reset GPS history on large movements
-
-        self.current_position = new_position
-
+    def update_position(self): #, lat: float, lon: float):
         self._check_and_fetch_data()
 
         self._map_match()
@@ -112,7 +105,7 @@ class TeToo:
                 self.params.put_nonblocking("dp_tetoo_data", json.dumps(self.prefetched_data, ensure_ascii=False))
 
                 with self.data_lock:
-                    self.map_matcher = HMMMapMatcher(self.current_road_network)
+                    self.map_matcher = MapMatcher(self.prefetched_data)
 
         if self.fetching_thread is not None and self.fetching_thread.is_alive():
             return
@@ -162,34 +155,21 @@ class TeToo:
         with self.data_lock:
             self.road_network = new_road_network
             self.index = new_index
-            self.current_road_network = self.road_network
-            #
-            # print(f"OSM Speed Cameras: {len(self.osm_speed_cameras)}")
-            # print(f"Taiwan Speed Cameras: {len(self.tw_speed_cameras)}")
 
     def _map_match(self):
-        if len(self.gps_history) < 2:
+        if len(self.gps_history) < 1*FREQ:
             return
 
-        force_match = False
-        if self.last_matched_bearing is not None:
-            if angle_diff(self.current_bearing, self.last_matched_bearing) > self.bearing_change_threshold:
-                force_match = True
+        if self.map_matcher is None:
+            return
 
-        if force_match or self._frame % 2 == 0:
-            if self.map_matcher is None:
-                return
-
-            # Use the entire GPS history for matching
-            matched_way = self.map_matcher.match(self.gps_history)
-
-            if matched_way is not None:
-                self.current_way = matched_way
-                self.last_matched_bearing = self.current_bearing  # Update last matched bearing
-            else:
-                self.current_way = None
-
-        self._frame += 1
+        self.current_way = self.map_matcher.update_position(Position(
+            lat=self.current_position[0],
+            lon=self.current_position[1],
+            bearing=self.current_position[2],
+            speed=self.current_position[3],
+            turn_signal=self.current_position[4],
+        ), time.time())
 
     def _get_road_info(self):
         if self.current_way is None:
@@ -200,11 +180,10 @@ class TeToo:
                 'tags': self.current_tags,
                 'confidence': 0.0
             }
-
-        way_data = self.road_network.get(self.current_way, {})
-        new_tags = way_data.get('tags', {})
-        new_road_name = new_tags.get('name', None)
-        new_max_speed = new_tags.get('maxspeed', '0')
+        way_id = self.current_way.way.id
+        new_road_name = self.current_way.way.name
+        new_tags = self.current_way.way.tags
+        new_max_speed = self.current_way.way.tags.get("maxspeed", '0')
 
         # Only update if the new name is different
         if new_road_name and new_road_name != self.current_road_name:
@@ -213,7 +192,7 @@ class TeToo:
             self.current_tags = new_tags
 
         return {
-            'id': self.current_way,
+            'id': way_id,
             'name': self.current_road_name,
             'maxspeed': self.current_max_speed,
             'tags': self.current_tags,
@@ -224,7 +203,7 @@ class TeToo:
         if self.current_position is None or self.current_bearing is None:
             return False, float('inf'), {}, ""
 
-        current_lat, current_lon = self.current_position
+        current_lat, current_lon, current_bearing, current_speed, current_turn_signal = self.current_position
         closest_feature_distance = float('inf')
         closest_feature_info = {}
         closest_feature_id = ""
@@ -267,16 +246,10 @@ class TeToo:
             if distance > max_distance:
                 continue
 
-            projected_point = calculate_predicted_position(self.current_position, self.current_bearing, distance)
-            parallel_distance_to_feature = haversine_distance(projected_point, feature_point)
-
-            if parallel_distance_to_feature > max_distance_in_parallel:
-                continue
-
             bearing = calculate_bearing(self.current_position, (feature_lat, feature_lon))
 
             # Check if the feature is ahead based on bearing
-            if feature_is_ahead(self.current_bearing, bearing) and distance < closest_feature_distance:
+            if feature_is_ahead(self.current_bearing, bearing, 20.) and distance < closest_feature_distance:
                 closest_feature_distance = distance
                 closest_feature_info = feature_data
                 closest_feature_id = feature_id
@@ -288,10 +261,49 @@ class TeToo:
         MAX_DISTANCE_IN_PARALLEL = 15
         return self._check_feature_ahead(custom.TeToo.FeatureType.trafficSignal, MAX_TRAFFIC_SIGNAL_DISTANCE, MAX_DISTANCE_IN_PARALLEL)
 
+    def should_warn_speed_camera(self, distance: float, speed_limit: float, road_speed_limit: float = 0.):
+        # If we don't know the speed limit or we don't have a threshold set, warn anyway
+        if speed_limit is None or self._speed_camera_threshold == 0:
+            return True
+
+        speed_limit = float(speed_limit)
+        should_warn = False
+
+        threshold = 1 + self._speed_camera_threshold
+
+        # when we have v_cruise set
+        if not should_warn and self.v_cruise > 0.:
+            speed_limit = float(speed_limit)
+            lower_bound = math.floor(self.v_cruise / threshold)
+            upper_bound = math.ceil(self.v_cruise * threshold)
+            should_warn = lower_bound <= speed_limit <= upper_bound
+
+        # when the current road has a speed limit
+        if not should_warn and road_speed_limit > 0.:
+            road_lower_bound = math.floor(road_speed_limit / threshold)
+            road_upper_bound = math.ceil(road_speed_limit * threshold)
+            should_warn = road_lower_bound <= speed_limit <= road_upper_bound
+
+        # use current speed
+        if not should_warn:
+            v_ego_kph = self.v_ego * CV.MS_TO_KPH
+            v_lower_bound = math.floor(v_ego_kph / threshold)
+            v_upper_bound = math.ceil(v_ego_kph * threshold)
+            should_warn = v_lower_bound <= speed_limit <= v_upper_bound
+
+        return should_warn
+
     def check_speed_camera_ahead(self) -> Tuple[bool, float, Dict, str]:
         MAX_SPEED_CAMERA_DISTANCE = 1000  # meters
         MAX_DISTANCE_IN_PARALLEL = 30
-        return self._check_feature_ahead(custom.TeToo.FeatureType.speedCamera, MAX_SPEED_CAMERA_DISTANCE, MAX_DISTANCE_IN_PARALLEL)
+        ahead, distance, info, id = self._check_feature_ahead(custom.TeToo.FeatureType.speedCamera, MAX_SPEED_CAMERA_DISTANCE, MAX_DISTANCE_IN_PARALLEL)
+
+        if ahead:
+            maxspeed = info.get('tags', {}).get('maxspeed')
+            if maxspeed:
+                info['maxspeed'] = maxspeed
+
+        return ahead, distance, info, id
 
     def _get_feature(self, type, func, display_tags=False):
         ahead, distance, info, id = func()
@@ -302,8 +314,6 @@ class TeToo:
             'type': type,
             'lat': float(info['lat']),
             'lon': float(info['lon']),
-            # keep it for future
-            # 'bearing': float(calculate_bearing((lat, lon), (info['lat'], info['lon'])))
             'distance': float(distance),
         }
         if display_tags:
@@ -311,11 +321,13 @@ class TeToo:
         return feature
 
     def tetoo_thread(self):
-        sm = messaging.SubMaster(['liveLocationKalman'])
+        sm = messaging.SubMaster(['liveLocationKalman', 'carState', 'controlsState'])
         pm = messaging.PubMaster(['teToo'])
         te_too_dat_prev = {}
-        update_counter = 0
-        rk = Ratekeeper(20)
+        rk = Ratekeeper(FREQ)
+        lat = 0.
+        lon = 0.
+        bearing = 0.
         while True:
             sm.update()
             location = sm['liveLocationKalman']
@@ -327,53 +339,60 @@ class TeToo:
                 lon = location.positionGeodetic.value[1]
                 bearing = math.degrees(location.calibratedOrientationNED.value[2])
 
-                # Update vEgo
-                self.v_ego = sm['liveLocationKalman'].velocityCalibrated.value[0]
+                self.v_ego = sm['carState'].vEgo
+                self.cruise_enabled = sm['carState'].cruiseState.enabled
+
+                # Update vCruise
+                self.v_cruise = sm['controlsState'].vCruise
 
                 # Update GPS history
-                self.gps_history.append((lat, lon))
+                if self.v_ego >= 2.6:
+                  self.gps_history.append((lat, lon, bearing, self.v_ego))
+                  self.bearing_history.append(bearing)
 
-                # Update bearing history
-                self.bearing_history.append(bearing)
+            use_prev = not localizer_valid or (localizer_valid and self.v_ego < 2.6)
 
-                # Calculate moving average of bearing, in case sudden change in direction.
-                self.current_bearing = sum(self.bearing_history) / len(self.bearing_history)
+            dat = messaging.new_message('teToo', valid=True)
+            if use_prev:
+                dat.teToo = te_too_dat_prev
+            else:
+                dat.teToo.lat = float(lat)
+                dat.teToo.lon = float(lon)
+                dat.teToo.bearing = float(bearing)
+                road_maxspeed = 0.
 
-            # Main logic at 2 Hz
-            if update_counter % 10 == 0:
-                use_prev = self.v_ego < 1.3 or not localizer_valid
+                blinker_state = 'left' if sm['carState'].leftBlinker else 'right' if sm['carState'].rightBlinker else None
+                self.current_position = (lat, lon, bearing, self.v_ego, blinker_state)
+                self.current_bearing = bearing
 
-                dat = messaging.new_message('teToo', valid=True)
-                if use_prev:
-                    dat.teToo = te_too_dat_prev
-                else:
-                    dat.teToo.lat = float(lat)
-                    dat.teToo.lon = float(lon)
-                    dat.teToo.bearing = float(self.current_bearing) if self.current_bearing is not None else 0.
+                if self._osm:
+                    road_info = self.update_position() #(lat, lon)
+                    dat.teToo.name = str("" if road_info['name'] is None else road_info['name'])
+                    dat.teToo.maxspeed = float(road_info['maxspeed'])
+                    road_maxspeed = dat.teToo.maxspeed
 
-                    self.current_position = (lat, lon)
+                features = []
+                # disable for now
+                # if self._osm:
+                #     traffic_signal_ahead = self._get_feature(custom.TeToo.FeatureType.trafficSignal, self.check_traffic_signal_ahead)
+                #     if traffic_signal_ahead:
+                #         features.append(traffic_signal_ahead)
 
-                    if self._osm:
-                        road_info = self.update_position(lat, lon)
-                        dat.teToo.name = str("" if road_info['name'] is None else road_info['name'])
-                        dat.teToo.maxspeed = float(road_info['maxspeed'])
-
-                    features = []
-                    if self._osm:
-                        traffic_signal_ahead = self._get_feature(custom.TeToo.FeatureType.trafficSignal, self.check_traffic_signal_ahead)
-                        if traffic_signal_ahead:
-                            features.append(traffic_signal_ahead)
-
-                    speed_camera_ahead = self._get_feature(custom.TeToo.FeatureType.speedCamera, self.check_speed_camera_ahead, True)
-                    if speed_camera_ahead:
+                speed_camera_ahead = self._get_feature(custom.TeToo.FeatureType.speedCamera, self.check_speed_camera_ahead, True)
+                if speed_camera_ahead:
+                    tags = speed_camera_ahead.get('tags', None)
+                    should_show = True
+                    if tags:
+                        maxspeed = json.loads(tags).get('maxspeed', None)
+                        should_show = self.should_warn_speed_camera(speed_camera_ahead['distance'], maxspeed, road_maxspeed)
+                    if should_show:
                         features.append(speed_camera_ahead)
-                    dat.teToo.nearestFeatures = features
+                dat.teToo.nearestFeatures = features
 
-                dat.teToo.updatingData = self._osm and (self.fetching_thread is not None and self.fetching_thread.is_alive())
-                pm.send('teToo', dat)
-                te_too_dat_prev = dat.teToo
+            dat.teToo.updatingData = self._osm and (self.fetching_thread is not None and self.fetching_thread.is_alive())
+            pm.send('teToo', dat)
+            te_too_dat_prev = dat.teToo
 
-            update_counter += 1
             rk.keep_time()
 
 def main():

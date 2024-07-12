@@ -21,10 +21,10 @@ class OverpassAPIHelper:
           way[highway][highway!~"^({excl_way_types})$"];
         ) -> .allways;
         (
-          way[highway][highway!~"^({excl_way_types})$"][!name];
+          way[highway][highway!~"^({excl_way_types}|motorway_link)$"][!name];
         ) -> .no_name_ways;
         (
-          way[highway][highway!~"^({excl_way_types})$"][service][service~"^(alley|driveway)$"];
+          way[highway][highway!~"^({excl_way_types})$"][service][service~"^(driveway)$"];
         ) -> .service_ways;
         (.allways; - .no_name_ways;) -> .way_result_1;
         (.way_result_1; - .service_ways;) -> .way_result_final;
