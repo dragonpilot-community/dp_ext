@@ -51,7 +51,8 @@ class Way:
 
     @property
     def name(self):
-        return self.tags.get('name', '')
+        # some road doesnt have name, use ID instead
+        return self.tags.get('name', self.id)
 
     @property
     def ref(self):
@@ -64,6 +65,27 @@ class Way:
     @property
     def lanes(self):
         return int(self.tags.get('lanes', '2'))
+
+    @property
+    def highway_type(self):
+        return self.tags.get('highway', '')
+
+    @property
+    def is_highway(self):
+        highway_types = ['motorway', 'trunk', 'primary', 'secondary', 'tertiary']
+        return self.highway_type in highway_types
+
+    @property
+    def bridge(self):
+        return self.tags.get('bridge', 'no').lower() == 'yes'
+
+    @property
+    def tunnel(self):
+        return self.tags.get('tunnel', 'no').lower() == 'yes'
+
+    @property
+    def layer(self):
+        return int(self.tags.get('layer', '0'))
 
 class OnWayResult:
     def __init__(self, on_way: bool, distance: float, is_forward: bool):
@@ -95,6 +117,7 @@ class MapMatcher:
         self.way_history = deque(maxlen=10)  # Increased history
         self.last_switch_time = 0
         self.switch_cooldown = 5  # Seconds to wait before allowing another switch
+        self.current_layer = 0
 
     def _load_ways(self, road_network: Dict) -> Dict[int, Way]:
         ways = {}
@@ -191,18 +214,40 @@ class MapMatcher:
         if way in self.way_history:
             score += 30
 
-        # Consider turn signals
-        if pos.turn_signal:
-            way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
-            if pos.turn_signal == 'left' and way_bearing < pos.bearing:
-                score += 40
-            elif pos.turn_signal == 'right' and way_bearing > pos.bearing:
-                score += 40
+        # Consider turn signals on highways
+        if pos.turn_signal and way.is_highway:
+            if self.current_way:
+                parallel_score = self._score_parallel_ways(self.current_way.way, way)
+                if parallel_score > 0:
+                    score += 40  # Likely a lane change on highway
+                else:
+                    # Could be exiting or changing to another highway
+                    way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
+                    if pos.turn_signal == 'left' and way_bearing < pos.bearing:
+                        score += 20
+                    elif pos.turn_signal == 'right' and way_bearing > pos.bearing:
+                        score += 20
+            else:
+                # If we don't have a current way, we can't determine if it's a lane change
+                # So we'll just give a small boost for matching the turn signal direction
+                way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
+                if pos.turn_signal == 'left' and way_bearing < pos.bearing:
+                    score += 10
+                elif pos.turn_signal == 'right' and way_bearing > pos.bearing:
+                    score += 10
 
-        # Consider lane changes
-        if self.current_way and way.id != self.current_way.way.id:
-            parallel_score = self._score_parallel_ways(self.current_way.way, way)
-            score += parallel_score
+        # Consider elevation (bridges, tunnels, layers)
+        if self.current_way:
+            if way.layer != self.current_layer:
+                score -= 50  # Penalize changing layers
+            if way.bridge != self.current_way.way.bridge:
+                score -= 30  # Penalize switching between bridge and non-bridge
+            if way.tunnel != self.current_way.way.tunnel:
+                score -= 30  # Penalize switching between tunnel and non-tunnel
+
+        # Consider one-way roads
+        if way.oneway and not on_way_result.is_forward:
+            score -= 100  # Heavily penalize going the wrong way on a one-way road
 
         return score
 
@@ -244,22 +289,31 @@ class MapMatcher:
             return self._update_current_way(pos, way, on_way_result)
 
         logger.warning("No matching way found")
+        self.current_way = None  # Clear the current way if we couldn't find a match
         return None
 
     def on_way(self, way: Way, pos: Position) -> OnWayResult:
+        logger.debug(f"Checking if on way: {way.id} - {way.name}")
         distance = self._distance_to_way(pos, way)
+        logger.debug(f"Distance to way: {distance:.2f} meters")
 
         lanes = way.lanes
         road_width_estimate = lanes * LANE_WIDTH
         max_dist = 5 + road_width_estimate
+        logger.debug(f"Max allowed distance: {max_dist:.2f} meters")
 
         if distance < max_dist:
             is_forward = self._is_forward(way.nodes[0], way.nodes[-1], pos.bearing)
+            logger.debug(f"Is forward: {is_forward}")
             if not is_forward and way.oneway:
+                logger.debug("Not on way: wrong direction on one-way road")
                 return OnWayResult(False, distance, is_forward)
+            logger.debug("On way: within max distance")
             return OnWayResult(True, distance, is_forward)
 
+        logger.debug("Not on way: outside max distance")
         return OnWayResult(False, distance, False)
+
 
     def _distance_to_way(self, pos: Position, way: Way) -> float:
         return min(self._point_to_line_distance(pos.lat, pos.lon, start.lat, start.lon, end.lat, end.lon)
