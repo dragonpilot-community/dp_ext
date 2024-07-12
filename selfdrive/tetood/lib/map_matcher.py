@@ -2,6 +2,7 @@ import math
 from typing import List, Dict, Tuple, Optional
 from rtree import index
 import logging
+from functools import lru_cache
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,12 +15,18 @@ PADDING = 100  # meters
 LANE_WIDTH = 3.7  # meters
 MIN_WAY_DIST = 500  # meters
 MAX_DISTANCE = 50  # meters, maximum distance to consider a way as matching
-SEARCH_RADIUS = 100  # meters, increased as per your test
+SEARCH_RADIUS = 100  # meters
 
 class Coordinates:
     def __init__(self, lat: float, lon: float):
         self.lat = lat
         self.lon = lon
+
+    def __eq__(self, other):
+        return isinstance(other, Coordinates) and self.lat == other.lat and self.lon == other.lon
+
+    def __hash__(self):
+        return hash((self.lat, self.lon))
 
 class Position:
     def __init__(self, lat: float, lon: float, bearing: float, speed: float):
@@ -94,8 +101,6 @@ class MapMatcher:
                 if len(way_nodes) >= 2:
                     ways[element['id']] = Way(element['id'], way_nodes, element.get('tags', {}))
         logger.info(f"Loaded {len(ways)} ways")
-        for way_id, way in ways.items():
-            logger.debug(f"Way {way_id}: {way.name or 'Unnamed'}, Nodes: {len(way.nodes)}, BBox: {way._bbox}")
         return ways
 
     def _build_rtree(self):
@@ -103,14 +108,12 @@ class MapMatcher:
         for way_id, way in self.ways.items():
             bbox = way._bbox
             idx.insert(way_id, (bbox[1], bbox[0], bbox[3], bbox[2]))  # Swap lat and lon
-            logger.debug(f"Inserted into R-tree: Way {way_id}, BBox: {bbox}")
         logger.info("R-tree index built")
         return idx
 
     def update_position(self, pos: Position) -> Optional[CurrentWay]:
         logger.debug(f"Updating position: lat={pos.lat}, lon={pos.lon}, bearing={pos.bearing}, speed={pos.speed}")
 
-        # Convert search radius from meters to degrees
         lat_change = SEARCH_RADIUS / (EARTH_RADIUS * TO_RADIANS)
         lon_change = SEARCH_RADIUS / (EARTH_RADIUS * TO_RADIANS * math.cos(math.radians(pos.lat)))
 
@@ -122,25 +125,14 @@ class MapMatcher:
         nearby_ways = list(self.rtree.intersection(search_bbox))
         logger.debug(f"Found {len(nearby_ways)} nearby ways")
 
-        if len(nearby_ways) == 0:
-            logger.warning("No nearby ways found. Checking all ways.")
-            for way_id, way in self.ways.items():
-                logger.debug(f"Checking way {way_id}: {way.name or 'Unnamed'}, BBox: {way._bbox}")
-                if self._bbox_intersects(search_bbox, way._bbox):
-                    nearby_ways.append(way_id)
-            logger.debug(f"Found {len(nearby_ways)} nearby ways after manual check")
-
         best_match = None
         best_distance = float('inf')
 
         for way_id in nearby_ways:
             way = self.ways.get(way_id)
             if way is None:
-                logger.warning(f"Way {way_id} not found in self.ways")
                 continue
-            logger.debug(f"Checking way {way_id}: {way.name or 'Unnamed'}")
             on_way_result = self.on_way(way, pos)
-            logger.debug(f"On way result: {on_way_result.on_way}, distance: {on_way_result.distance}")
             if on_way_result.on_way and on_way_result.distance < best_distance:
                 best_match = (way, on_way_result)
                 best_distance = on_way_result.distance
@@ -153,65 +145,47 @@ class MapMatcher:
         return None
 
     def on_way(self, way: Way, pos: Position) -> OnWayResult:
-        logger.debug(f"Checking if on way: {way.id} - {way.name}")
         distance = self._distance_to_way(pos, way)
-        logger.debug(f"Distance to way: {distance:.2f} meters")
 
         lanes = way.lanes
         road_width_estimate = lanes * LANE_WIDTH
         max_dist = 5 + road_width_estimate
-        logger.debug(f"Max allowed distance: {max_dist:.2f} meters")
 
         if distance < max_dist:
             is_forward = self._is_forward(way.nodes[0], way.nodes[-1], pos.bearing)
-            logger.debug(f"Is forward: {is_forward}")
             if not is_forward and way.oneway:
-                logger.debug("Not on way: wrong direction on one-way road")
                 return OnWayResult(False, distance, is_forward)
-            logger.debug("On way: within max distance")
             return OnWayResult(True, distance, is_forward)
 
-        logger.debug("Not on way: outside max distance")
         return OnWayResult(False, distance, False)
 
     def _distance_to_way(self, pos: Position, way: Way) -> float:
-        min_distance = float('inf')
-        for i in range(len(way.nodes) - 1):
-            start, end = way.nodes[i], way.nodes[i + 1]
-            distance = self._point_to_line_distance(pos.lat, pos.lon, start.lat, start.lon, end.lat, end.lon)
-            logger.debug(f"Segment distance: {distance:.2f} meters")
-            if distance < min_distance:
-                min_distance = distance
-        logger.debug(f"Minimum distance to way: {min_distance:.2f} meters")
-        return min_distance
+        return min(self._point_to_line_distance(pos.lat, pos.lon, start.lat, start.lon, end.lat, end.lon)
+                   for start, end in zip(way.nodes, way.nodes[1:]))
 
     @staticmethod
+    @lru_cache(maxsize=1024)
     def _point_to_line_distance(px, py, x1, y1, x2, y2):
-        # Convert all coordinates to radians
         px, py, x1, y1, x2, y2 = map(math.radians, [px, py, x1, y1, x2, y2])
 
-        # Calculate the length of the line segment
         line_length = MapMatcher._haversine_distance(y1, x1, y2, x2)
         if line_length == 0:
             return MapMatcher._haversine_distance(py, px, y1, x1)
 
-        # Calculate the cross-track distance
         a = MapMatcher._haversine_distance(py, px, y1, x1)
         b = MapMatcher._haversine_distance(py, px, y2, x2)
         c = line_length
 
-        # Use Heron's formula to calculate the area of the triangle
         s = (a + b + c) / 2
-        area = math.sqrt(abs(s * (s-a) * (s-b) * (s-c)))  # Using abs to avoid potential numerical issues
+        area = math.sqrt(abs(s * (s-a) * (s-b) * (s-c)))
 
-        # Calculate the height of the triangle (perpendicular distance)
         height = 2 * area / c
 
         return height
 
     @staticmethod
+    @lru_cache(maxsize=1024)
     def _haversine_distance(lat1, lon1, lat2, lon2):
-        # lat1, lon1, lat2, lon2 are assumed to be in radians
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
@@ -225,6 +199,7 @@ class MapMatcher:
         return bearing_diff < 90 or bearing_diff > 270
 
     @staticmethod
+    @lru_cache(maxsize=1024)
     def _calculate_bearing(start: Coordinates, end: Coordinates) -> float:
         y = math.sin(math.radians(end.lon - start.lon)) * math.cos(math.radians(end.lat))
         x = math.cos(math.radians(start.lat)) * math.sin(math.radians(end.lat)) - \
@@ -257,7 +232,7 @@ class MapMatcher:
                 break
             next_ways.append(nw)
             way = nw.way
-            start_pos = Position(nw.start_position.lat, nw.start_position.lon, 0, 0)  # Bearing and speed are not used here
+            start_pos = Position(nw.start_position.lat, nw.start_position.lon, 0, 0)
             forward = nw.is_forward
 
         if not next_ways:
@@ -269,13 +244,8 @@ class MapMatcher:
 
     def _distance_to_end_of_way(self, pos: Position, way: Way, is_forward: bool) -> float:
         nodes = way.nodes if is_forward else reversed(way.nodes)
-        total_distance = 0
-        prev_node = None
-        for node in nodes:
-            if prev_node:
-                total_distance += self._haversine_distance(prev_node.lat, prev_node.lon, node.lat, node.lon)
-            prev_node = node
-        return total_distance
+        return sum(self._haversine_distance(prev.lat, prev.lon, curr.lat, curr.lon)
+                   for prev, curr in zip(nodes, nodes[1:]))
 
     def _next_way(self, way: Way, is_forward: bool) -> Optional[NextWayResult]:
         match_node = way.nodes[-1] if is_forward else way.nodes[0]
@@ -284,43 +254,27 @@ class MapMatcher:
         if not matching_ways:
             return None
 
-        # First, try to find a way with the same name
         for mway in matching_ways:
-            if mway.name == way.name:
+            if mway.name == way.name or mway.ref == way.ref:
                 next_is_forward = self._next_is_forward(mway, match_node)
                 if not next_is_forward and mway.oneway:
                     continue
                 start, end = self._get_way_start_end(mway, next_is_forward)
                 return NextWayResult(mway, next_is_forward, start, end)
 
-        # Then, try to find a way with the same ref
-        for mway in matching_ways:
-            if mway.ref == way.ref:
-                next_is_forward = self._next_is_forward(mway, match_node)
-                if not next_is_forward and mway.oneway:
-                    continue
-                start, end = self._get_way_start_end(mway, next_is_forward)
-                return NextWayResult(mway, next_is_forward, start, end)
-
-        # Finally, return the way with the least curvature
         min_curv_way = min(matching_ways, key=lambda w: self._get_curvature(way, w, match_node))
         next_is_forward = self._next_is_forward(min_curv_way, match_node)
         start, end = self._get_way_start_end(min_curv_way, next_is_forward)
         return NextWayResult(min_curv_way, next_is_forward, start, end)
 
     def _matching_ways(self, current_way: Way, match_node: Coordinates) -> List[Way]:
-        matching_ways = []
-        for way in self.ways.values():
-            if way.id == current_way.id:
-                continue
-            if (way.nodes[0].lat == match_node.lat and way.nodes[0].lon == match_node.lon) or \
-                    (way.nodes[-1].lat == match_node.lat and way.nodes[-1].lon == match_node.lon):
-                matching_ways.append(way)
-        return matching_ways
+        return [way for way in self.ways.values()
+                if way.id != current_way.id and
+                (way.nodes[0] == match_node or way.nodes[-1] == match_node)]
 
     @staticmethod
     def _next_is_forward(next_way: Way, match_node: Coordinates) -> bool:
-        return not (next_way.nodes[-1].lat == match_node.lat and next_way.nodes[-1].lon == match_node.lon)
+        return next_way.nodes[0] == match_node
 
     @staticmethod
     def _get_curvature(way1: Way, way2: Way, match_node: Coordinates) -> float:
