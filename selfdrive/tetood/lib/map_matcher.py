@@ -4,9 +4,11 @@ from rtree import index
 import logging
 from functools import lru_cache
 from collections import deque
+from dataclasses import dataclass
+import numpy as np
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -19,6 +21,7 @@ MAX_DISTANCE = 25  # meters, maximum distance to consider a way as matching
 SEARCH_RADIUS = 50  # meters
 
 class Coordinates:
+    __slots__ = ['lat', 'lon']
     def __init__(self, lat: float, lon: float):
         self.lat = lat
         self.lon = lon
@@ -30,12 +33,35 @@ class Coordinates:
         return hash((self.lat, self.lon))
 
 class Position:
+    __slots__ = ['lat', 'lon', 'bearing', 'speed', 'turn_signal']
     def __init__(self, lat: float, lon: float, bearing: float, speed: float, turn_signal: Optional[str] = None):
         self.lat = lat
         self.lon = lon
         self.bearing = bearing
         self.speed = speed  # Speed in meters per second
         self.turn_signal = turn_signal  # 'left', 'right', or None
+
+@dataclass
+class OnWayResult:
+    on_way: bool
+    distance: float
+    is_forward: bool
+
+@dataclass
+class CurrentWay:
+    way: 'Way'
+    distance: float
+    on_way: OnWayResult
+    start_position: Coordinates
+    end_position: Coordinates
+    confidence: float
+
+@dataclass
+class NextWayResult:
+    way: 'Way'
+    is_forward: bool
+    start_position: Coordinates
+    end_position: Coordinates
 
 class Way:
     def __init__(self, id: int, nodes: List[Coordinates], tags: Dict[str, str]):
@@ -87,34 +113,13 @@ class Way:
     def layer(self):
         return int(self.tags.get('layer', '0'))
 
-class OnWayResult:
-    def __init__(self, on_way: bool, distance: float, is_forward: bool):
-        self.on_way = on_way
-        self.distance = distance
-        self.is_forward = is_forward
-
-class CurrentWay:
-    def __init__(self, way: Way, distance: float, on_way: OnWayResult, start_pos: Coordinates, end_pos: Coordinates):
-        self.way = way
-        self.distance = distance
-        self.on_way = on_way
-        self.start_position = start_pos
-        self.end_position = end_pos
-
-class NextWayResult:
-    def __init__(self, way: Way, is_forward: bool, start_position: Coordinates, end_position: Coordinates):
-        self.way = way
-        self.is_forward = is_forward
-        self.start_position = start_position
-        self.end_position = end_position
-
 class MapMatcher:
     def __init__(self, road_network: Dict):
         self.ways = self._load_ways(road_network)
         self.rtree = self._build_rtree()
         self.current_way = None
-        self.position_history = deque(maxlen=10)  # Increased history
-        self.way_history = deque(maxlen=10)  # Increased history
+        self.position_history = deque(maxlen=10)
+        self.way_history = deque(maxlen=10)
         self.last_switch_time = 0
         self.switch_cooldown = 5  # Seconds to wait before allowing another switch
         self.current_layer = 0
@@ -152,19 +157,15 @@ class MapMatcher:
         return [self.ways[way_id] for way_id in nearby_way_ids]
 
     def _get_candidate_ways(self, nearby_ways: List[Way], pos: Position) -> List[Tuple[Way, OnWayResult]]:
-        candidates = []
-        for way in nearby_ways:
-            on_way_result = self.on_way(way, pos)
-            if on_way_result.on_way:
-                candidates.append((way, on_way_result))
-        return candidates
+        return [(way, self.on_way(way, pos)) for way in nearby_ways if self.on_way(way, pos).on_way]
 
-    def _select_best_match(self, candidates: List[Tuple[Way, OnWayResult]], pos: Position, timestamp: float) -> Optional[Tuple[Way, OnWayResult]]:
+    def _select_best_match(self, candidates: List[Tuple[Way, OnWayResult]], pos: Position, timestamp: float) -> Optional[Tuple[Way, OnWayResult, float]]:
         if not candidates:
             return None
 
         if len(candidates) == 1:
-            return candidates[0]
+            way, on_way_result = candidates[0]
+            return (way, on_way_result, self._calculate_confidence(way, on_way_result, pos))
 
         scored_candidates = [(way, on_way_result, self._score_candidate(way, on_way_result, pos))
                              for way, on_way_result in candidates]
@@ -172,105 +173,98 @@ class MapMatcher:
         best_match = max(scored_candidates, key=lambda x: x[2])
         best_way, best_on_way_result, best_score = best_match
 
+        if self._is_at_intersection(candidates):
+            return self._handle_intersection(scored_candidates, pos)
+
         # Implement snapping logic
         if self.current_way and self.current_way.way.id != best_way.id:
             time_since_last_switch = timestamp - self.last_switch_time
             if time_since_last_switch < self.switch_cooldown:
-                # If we recently switched, prefer staying on the current way
                 current_way_candidate = next((c for c in scored_candidates if c[0].id == self.current_way.way.id), None)
                 if current_way_candidate:
                     current_way, current_on_way_result, current_score = current_way_candidate
                     if current_score > best_score * 0.8:  # Allow some tolerance
-                        return (current_way, current_on_way_result)
+                        return (current_way, current_on_way_result, self._calculate_confidence(current_way, current_on_way_result, pos))
             else:
-                # If enough time has passed, allow switching and update the last switch time
                 self.last_switch_time = timestamp
 
-        return (best_way, best_on_way_result)
+        return (best_way, best_on_way_result, self._calculate_confidence(best_way, best_on_way_result, pos))
 
     def _score_candidate(self, way: Way, on_way_result: OnWayResult, pos: Position) -> float:
-        score = 100 - on_way_result.distance  # Base score on distance (closer is better)
-
-        # Prefer continuing on the same road
-        if self.current_way and way.id == self.current_way.way.id:
-            score += 50
-
-        # Consider trajectory
-        if len(self.position_history) >= 2:
-            prev_pos = self.position_history[-1]
-            expected_bearing = self._calculate_bearing(
-                Coordinates(prev_pos.lat, prev_pos.lon),
-                Coordinates(pos.lat, pos.lon)
-            )
-            bearing_diff = abs(expected_bearing - pos.bearing)
-            score -= min(bearing_diff, 360 - bearing_diff)  # Penalize based on bearing difference
-
-        # Speed is in m/s, so 8.33 m/s is about 30 km/h, and 1.39 m/s is about 5 km/h
-        score += 20 if pos.speed > 8.33 else (-20 if pos.speed < 1.39 else 0)
-
-        # Consider historical matches
-        if way in self.way_history:
-            score += 30
-
-        # Consider turn signals on highways
-        if pos.turn_signal and way.is_highway:
-            if self.current_way:
-                parallel_score = self._score_parallel_ways(self.current_way.way, way)
-                if parallel_score > 0:
-                    score += 40  # Likely a lane change on highway
-                else:
-                    # Could be exiting or changing to another highway
-                    way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
-                    if pos.turn_signal == 'left' and way_bearing < pos.bearing:
-                        score += 20
-                    elif pos.turn_signal == 'right' and way_bearing > pos.bearing:
-                        score += 20
-            else:
-                # If we don't have a current way, we can't determine if it's a lane change
-                # So we'll just give a small boost for matching the turn signal direction
-                way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
-                if pos.turn_signal == 'left' and way_bearing < pos.bearing:
-                    score += 10
-                elif pos.turn_signal == 'right' and way_bearing > pos.bearing:
-                    score += 10
-
-        # Consider elevation (bridges, tunnels, layers)
-        if self.current_way:
-            if way.layer != self.current_layer:
-                score -= 50  # Penalize changing layers
-            if way.bridge != self.current_way.way.bridge:
-                score -= 30  # Penalize switching between bridge and non-bridge
-            if way.tunnel != self.current_way.way.tunnel:
-                score -= 30  # Penalize switching between tunnel and non-tunnel
-
-        # Consider one-way roads
-        if way.oneway and not on_way_result.is_forward:
-            score -= 100  # Heavily penalize going the wrong way on a one-way road
-
+        score = self._score_distance(on_way_result.distance)
+        score += self._score_continuity(way)
+        score += self._score_trajectory(pos)
+        score += self._score_speed(pos.speed)
+        score += self._score_historical_matches(way)
+        score += self._score_turn_signals(way, pos)
+        score += self._score_elevation(way)
+        score += self._score_one_way(way, on_way_result)
         return score
 
-    def _score_parallel_ways(self, current_way: Way, candidate_way: Way) -> float:
-        # Check if ways are roughly parallel and close to each other
-        if len(current_way.nodes) < 2 or len(candidate_way.nodes) < 2:
+    def _score_distance(self, distance: float) -> float:
+        return 100 - distance
+
+    def _score_continuity(self, way: Way) -> float:
+        return 50 if self.current_way and way.id == self.current_way.way.id else 0
+
+    def _score_trajectory(self, pos: Position) -> float:
+        if len(self.position_history) < 2:
             return 0
+        prev_pos = self.position_history[-1]
+        expected_bearing = self._calculate_bearing(
+            Coordinates(prev_pos.lat, prev_pos.lon),
+            Coordinates(pos.lat, pos.lon)
+        )
+        bearing_diff = abs(expected_bearing - pos.bearing)
+        return -min(bearing_diff, 360 - bearing_diff)
 
-        current_bearing = self._calculate_bearing(current_way.nodes[0], current_way.nodes[-1])
-        candidate_bearing = self._calculate_bearing(candidate_way.nodes[0], candidate_way.nodes[-1])
+    def _score_speed(self, speed: float) -> float:
+        return 20 if speed > 8.33 else (-20 if speed < 1.39 else 0)
 
-        bearing_diff = abs(current_bearing - candidate_bearing)
-        if bearing_diff > 20 and bearing_diff < 340:  # Not parallel
+    def _score_historical_matches(self, way: Way) -> float:
+        return 30 if way in self.way_history else 0
+
+    def _score_turn_signals(self, way: Way, pos: Position) -> float:
+        if not pos.turn_signal or not way.is_highway:
             return 0
+        if self.current_way:
+            parallel_score = self._score_parallel_ways(self.current_way.way, way)
+            if parallel_score > 0:
+                return 40
+        way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
+        return 20 if (pos.turn_signal == 'left' and way_bearing < pos.bearing) or \
+                     (pos.turn_signal == 'right' and way_bearing > pos.bearing) else 0
 
-        # Check distance between ways
-        min_distance = min(self._point_to_line_distance(node.lat, node.lon,
-                                                        candidate_way.nodes[0].lat, candidate_way.nodes[0].lon,
-                                                        candidate_way.nodes[-1].lat, candidate_way.nodes[-1].lon)
-                           for node in current_way.nodes)
+    def _score_elevation(self, way: Way) -> float:
+        if not self.current_way:
+            return 0
+        score = 0
+        if way.layer != self.current_layer:
+            score -= 50
+        if way.bridge != self.current_way.way.bridge:
+            score -= 30
+        if way.tunnel != self.current_way.way.tunnel:
+            score -= 30
+        return score
 
-        if 5 < min_distance < 20:  # Typical lane width range
-            return 30  # Boost score for potential lane change
+    def _score_one_way(self, way: Way, on_way_result: OnWayResult) -> float:
+        return -100 if way.oneway and not on_way_result.is_forward else 0
 
-        return 0
+    def _is_at_intersection(self, candidates: List[Tuple[Way, OnWayResult]]) -> bool:
+        return len(candidates) > 2
+
+    def _handle_intersection(self, scored_candidates: List[Tuple[Way, OnWayResult, float]], pos: Position) -> Tuple[Way, OnWayResult, float]:
+        # Implement more sophisticated intersection handling logic here
+        # For now, we'll just return the highest scored candidate
+        return max(scored_candidates, key=lambda x: x[2])
+
+    def _calculate_confidence(self, way: Way, on_way_result: OnWayResult, pos: Position) -> float:
+        # Implement a confidence calculation based on various factors
+        # This is a simple example; you might want to develop a more sophisticated model
+        base_confidence = 1.0 - (on_way_result.distance / MAX_DISTANCE)
+        trajectory_confidence = 1.0 if len(self.position_history) < 2 else \
+            1.0 - min(abs(self._calculate_bearing(self.position_history[-1], pos) - pos.bearing) / 180.0, 1.0)
+        return (base_confidence + trajectory_confidence) / 2
 
     def update_position(self, pos: Position, timestamp: float) -> Optional[CurrentWay]:
         logger.debug(f"Updating position: lat={pos.lat}, lon={pos.lon}, bearing={pos.bearing}, speed={pos.speed}, turn_signal={pos.turn_signal}")
@@ -280,14 +274,14 @@ class MapMatcher:
         best_match = self._select_best_match(candidate_ways, pos, timestamp)
 
         if best_match:
-            way, on_way_result = best_match
-            logger.info(f"Matched to way: {way.id}")
+            way, on_way_result, confidence = best_match
+            logger.info(f"Matched to way: {way.id} with confidence {confidence:.2f}")
             self.position_history.append(pos)
             self.way_history.append(way)
-            return self._update_current_way(pos, way, on_way_result)
+            return self._update_current_way(pos, way, on_way_result, confidence)
 
         logger.warning("No matching way found")
-        self.current_way = None  # Clear the current way if we couldn't find a match
+        self.current_way = None
         return None
 
     def on_way(self, way: Way, pos: Position) -> OnWayResult:
@@ -306,8 +300,8 @@ class MapMatcher:
     @lru_cache(maxsize=1024)
     def _distance_to_way(self, pos_lat: float, pos_lon: float, way_id: int) -> float:
         way = self.ways[way_id]
-        return min(self._point_to_line_distance(pos_lat, pos_lon, start.lat, start.lon, end.lat, end.lon)
-                   for start, end in zip(way.nodes, way.nodes[1:]))
+        return np.min([self._point_to_line_distance(pos_lat, pos_lon, start.lat, start.lon, end.lat, end.lon)
+                       for start, end in zip(way.nodes, way.nodes[1:])])
 
     @staticmethod
     @lru_cache(maxsize=1024)
@@ -334,8 +328,8 @@ class MapMatcher:
     def _haversine_distance(lat1, lon1, lat2, lon2):
         dlat = lat2 - lat1
         dlon = lon2 - lon1
-        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
         return EARTH_RADIUS * c
 
     def _is_forward(self, way_id: int, bearing: float) -> bool:
@@ -352,15 +346,16 @@ class MapMatcher:
     @staticmethod
     @lru_cache(maxsize=1024)
     def _calculate_bearing(start: Coordinates, end: Coordinates) -> float:
-        y = math.sin(math.radians(end.lon - start.lon)) * math.cos(math.radians(end.lat))
-        x = math.cos(math.radians(start.lat)) * math.sin(math.radians(end.lat)) - \
-            math.sin(math.radians(start.lat)) * math.cos(math.radians(end.lat)) * math.cos(math.radians(end.lon - start.lon))
-        bearing = math.atan2(y, x)
-        return (math.degrees(bearing) + 360) % 360
+        y = np.sin(np.radians(end.lon - start.lon)) * np.cos(np.radians(end.lat))
+        x = np.cos(np.radians(start.lat)) * np.sin(np.radians(end.lat)) - \
+            np.sin(np.radians(start.lat)) * np.cos(np.radians(end.lat)) * np.cos(np.radians(end.lon - start.lon))
+        bearing = np.arctan2(y, x)
+        return (np.degrees(bearing) + 360) % 360
 
-    def _update_current_way(self, pos: Position, way: Way, on_way: OnWayResult) -> CurrentWay:
+    def _update_current_way(self, pos: Position, way: Way, on_way: OnWayResult, confidence: float) -> CurrentWay:
         start, end = self._get_way_start_end(way, on_way.is_forward)
-        return CurrentWay(way, on_way.distance, on_way, start, end)
+        self.current_layer = way.layer
+        return CurrentWay(way, on_way.distance, on_way, start, end, confidence)
 
     @staticmethod
     def _get_way_start_end(way: Way, is_forward: bool) -> Tuple[Coordinates, Coordinates]:
@@ -394,9 +389,9 @@ class MapMatcher:
         return next_ways
 
     def _distance_to_end_of_way(self, pos: Position, way: Way, is_forward: bool) -> float:
-        nodes = way.nodes if is_forward else reversed(way.nodes)
-        return sum(self._haversine_distance(prev.lat, prev.lon, curr.lat, curr.lon)
-                   for prev, curr in zip(nodes, nodes[1:]))
+        nodes = way.nodes if is_forward else list(reversed(way.nodes))
+        return np.sum([self._haversine_distance(prev.lat, prev.lon, curr.lat, curr.lon)
+                       for prev, curr in zip(nodes, nodes[1:])])
 
     def _next_way(self, way: Way, is_forward: bool) -> Optional[NextWayResult]:
         match_node = way.nodes[-1] if is_forward else way.nodes[0]
@@ -439,6 +434,24 @@ class MapMatcher:
         angle2 = MapMatcher._calculate_bearing(match_node, node2)
 
         return abs(angle2 - angle1)
+
+    def _score_parallel_ways(self, current_way: Way, candidate_way: Way) -> float:
+        if len(current_way.nodes) < 2 or len(candidate_way.nodes) < 2:
+            return 0
+
+        current_bearing = self._calculate_bearing(current_way.nodes[0], current_way.nodes[-1])
+        candidate_bearing = self._calculate_bearing(candidate_way.nodes[0], candidate_way.nodes[-1])
+
+        bearing_diff = abs(current_bearing - candidate_bearing)
+        if bearing_diff > 20 and bearing_diff < 340:  # Not parallel
+            return 0
+
+        min_distance = np.min([self._point_to_line_distance(node.lat, node.lon,
+                                                            candidate_way.nodes[0].lat, candidate_way.nodes[0].lon,
+                                                            candidate_way.nodes[-1].lat, candidate_way.nodes[-1].lon)
+                               for node in current_way.nodes])
+
+        return 30 if 5 < min_distance < 20 else 0  # Boost score for potential lane change
 
     @staticmethod
     def _bbox_intersects(bbox1, bbox2):
