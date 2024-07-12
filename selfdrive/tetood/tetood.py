@@ -11,6 +11,8 @@ import cereal.messaging as messaging
 from cereal import log, custom
 from openpilot.common.params import Params
 from openpilot.common.realtime import Ratekeeper
+from openpilot.common.conversions import Conversions as CV
+from openpilot.system.hardware import PC
 
 from openpilot.dp_ext.selfdrive.tetood.lib.map_matcher import MapMatcher, Position
 from openpilot.dp_ext.selfdrive.tetood.lib.overpass_api_helper import OverpassAPIHelper
@@ -47,13 +49,14 @@ class TeToo:
 
         self.v_ego = 0.
         self.v_cruise = 0.
+        self.cruise_enabled = False
 
         self.gps_history = deque(maxlen=1*FREQ)
         self.bearing_history = deque(maxlen=1*FREQ)
 
-        self._osm = self.params.get_bool("dp_tetoo")
-        self._taiwan_speed_camera_enabled = self.params.get_bool("dp_tetoo_speed_camera_taiwan")
-        self._speed_camera_threshold = 1 + int(self.params.get_bool("dp_tetoo_speed_camera_threshold")) * 0.01
+        self._osm = True if PC else self.params.get_bool("dp_tetoo")
+        self._taiwan_speed_camera_enabled = True if PC else self.params.get_bool("dp_tetoo_speed_camera_taiwan")
+        self._speed_camera_threshold = int(self.params.get_bool("dp_tetoo_speed_camera_threshold")) * 0.01
 
         self.osm_speed_cameras = {}
         self.tw_speed_cameras = {}
@@ -258,10 +261,49 @@ class TeToo:
         MAX_DISTANCE_IN_PARALLEL = 15
         return self._check_feature_ahead(custom.TeToo.FeatureType.trafficSignal, MAX_TRAFFIC_SIGNAL_DISTANCE, MAX_DISTANCE_IN_PARALLEL)
 
+    def should_warn_speed_camera(self, distance: float, speed_limit: float, road_speed_limit: float = 0.):
+        # If we don't know the speed limit or we don't have a threshold set, warn anyway
+        if speed_limit is None or self._speed_camera_threshold == 0:
+            return True
+
+        speed_limit = float(speed_limit)
+        should_warn = False
+
+        threshold = 1 + self._speed_camera_threshold
+
+        # when we have v_cruise set
+        if not should_warn and self.v_cruise > 0.:
+            speed_limit = float(speed_limit)
+            lower_bound = math.floor(self.v_cruise / threshold)
+            upper_bound = math.ceil(self.v_cruise * threshold)
+            should_warn = lower_bound <= speed_limit <= upper_bound
+
+        # when the current road has a speed limit
+        if not should_warn and road_speed_limit > 0.:
+            road_lower_bound = math.floor(road_speed_limit / threshold)
+            road_upper_bound = math.ceil(road_speed_limit * threshold)
+            should_warn = road_lower_bound <= speed_limit <= road_upper_bound
+
+        # use current speed
+        if not should_warn:
+            v_ego_kph = self.v_ego * CV.MS_TO_KPH
+            v_lower_bound = math.floor(v_ego_kph / threshold)
+            v_upper_bound = math.ceil(v_ego_kph * threshold)
+            should_warn = v_lower_bound <= speed_limit <= v_upper_bound
+
+        return should_warn
+
     def check_speed_camera_ahead(self) -> Tuple[bool, float, Dict, str]:
         MAX_SPEED_CAMERA_DISTANCE = 1000  # meters
         MAX_DISTANCE_IN_PARALLEL = 30
-        return self._check_feature_ahead(custom.TeToo.FeatureType.speedCamera, MAX_SPEED_CAMERA_DISTANCE, MAX_DISTANCE_IN_PARALLEL)
+        ahead, distance, info, id = self._check_feature_ahead(custom.TeToo.FeatureType.speedCamera, MAX_SPEED_CAMERA_DISTANCE, MAX_DISTANCE_IN_PARALLEL)
+
+        if ahead:
+            maxspeed = info.get('tags', {}).get('maxspeed')
+            if maxspeed:
+                info['maxspeed'] = maxspeed
+
+        return ahead, distance, info, id
 
     def _get_feature(self, type, func, display_tags=False):
         ahead, distance, info, id = func()
@@ -297,8 +339,8 @@ class TeToo:
                 lon = location.positionGeodetic.value[1]
                 bearing = math.degrees(location.calibratedOrientationNED.value[2])
 
-                # Update vEgo
                 self.v_ego = sm['carState'].vEgo
+                self.cruise_enabled = sm['carState'].cruiseState.enabled
 
                 # Update vCruise
                 self.v_cruise = sm['controlsState'].vCruise
@@ -317,6 +359,7 @@ class TeToo:
                 dat.teToo.lat = float(lat)
                 dat.teToo.lon = float(lon)
                 dat.teToo.bearing = float(bearing)
+                road_maxspeed = 0.
 
                 blinker_state = 'left' if sm['carState'].leftBlinker else 'right' if sm['carState'].rightBlinker else None
                 self.current_position = (lat, lon, bearing, self.v_ego, blinker_state)
@@ -326,18 +369,24 @@ class TeToo:
                     road_info = self.update_position() #(lat, lon)
                     dat.teToo.name = str("" if road_info['name'] is None else road_info['name'])
                     dat.teToo.maxspeed = float(road_info['maxspeed'])
+                    road_maxspeed = dat.teToo.maxspeed
 
                 features = []
-                if self._osm:
-                    traffic_signal_ahead = self._get_feature(custom.TeToo.FeatureType.trafficSignal, self.check_traffic_signal_ahead)
-                    if traffic_signal_ahead:
-                        features.append(traffic_signal_ahead)
+                # disable for now
+                # if self._osm:
+                #     traffic_signal_ahead = self._get_feature(custom.TeToo.FeatureType.trafficSignal, self.check_traffic_signal_ahead)
+                #     if traffic_signal_ahead:
+                #         features.append(traffic_signal_ahead)
 
                 speed_camera_ahead = self._get_feature(custom.TeToo.FeatureType.speedCamera, self.check_speed_camera_ahead, True)
                 if speed_camera_ahead:
-                    if self.should_warn_speed_camera(speed_camera_ahead.get('speed_limit')):
-                        speed_camera_ahead['warning'] = True
-                    features.append(speed_camera_ahead)
+                    tags = speed_camera_ahead.get('tags', None)
+                    should_show = True
+                    if tags:
+                        maxspeed = json.loads(tags).get('maxspeed', None)
+                        should_show = self.should_warn_speed_camera(speed_camera_ahead['distance'], maxspeed, road_maxspeed)
+                    if should_show:
+                        features.append(speed_camera_ahead)
                 dat.teToo.nearestFeatures = features
 
             dat.teToo.updatingData = self._osm and (self.fetching_thread is not None and self.fetching_thread.is_alive())
