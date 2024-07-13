@@ -23,6 +23,7 @@
 #
 # Version = 2024-03-29
 from common.numpy_fast import interp
+from openpilot.common.params import Params
 
 # d-e2e, from modeldata.h
 TRAJECTORY_SIZE = 33
@@ -88,6 +89,7 @@ class DynamicEndtoEndController:
     self._mode_prev = 'acc'
     self._mode_changed = False
     self._frame = 0
+    self._road_condition_detection = Params().get_bool('dp_long_de2e_road_condition')
 
     self._lead_gmac = GenericMovingAverageCalculator(window_size=LEAD_WINDOW_SIZE)
     self._has_lead_filtered = False
@@ -213,7 +215,7 @@ class DynamicEndtoEndController:
 
     # when detecting slow down scenario: blended
     # e.g. traffic light, curve, stop sign etc.
-    if self._has_slow_down:
+    if self._road_condition_detection and self._has_slow_down:
       self._set_mode('blended')
       return
 
@@ -261,7 +263,7 @@ class DynamicEndtoEndController:
 
     # when detecting slow down scenario: blended
     # e.g. traffic light, curve, stop sign etc.
-    if self._has_slow_down:
+    if self._road_condition_detection and self._has_slow_down:
       self._set_mode('blended')
       return
 
