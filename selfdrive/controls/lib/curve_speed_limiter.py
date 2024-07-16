@@ -15,6 +15,8 @@ class CurveSpeedLimiter:
         pass
 
     def update(self, v_ego, z, v):
+        if not self._enabled:
+            return
         max_lat_accel = interp(v_ego, [5, 10, 20], [1.5, 2.0, 3.0])
         curvatures = np.interp(T_IDXS_MPC, ModelConstants.T_IDXS, z) / np.clip(v, 0.3, 100.0)
         max_v = np.sqrt(max_lat_accel / (np.abs(curvatures) + 1e-3)) - 2.0
