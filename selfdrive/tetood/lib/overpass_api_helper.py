@@ -20,18 +20,10 @@ class OverpassAPIHelper:
         (
           way[highway][highway!~"^({excl_way_types})$"];
         ) -> .allways;
-        (
-          way[highway][highway!~"^({excl_way_types}|motorway_link)$"][!name];
-        ) -> .no_name_ways;
-        (
-          way[highway][highway!~"^({excl_way_types})$"][service][service~"^(driveway)$"];
-        ) -> .service_ways;
-        (.allways; - .no_name_ways;) -> .way_result_1;
-        (.way_result_1; - .service_ways;) -> .way_result_final;
-        (.way_result_final;>;);
+        (.allways;>;);
         out body;
         """
-        # print(overpass_query)
+        print(overpass_query)
         try:
           response = requests.get(self.url, params={'data': overpass_query}, headers=self.headers)
         except:
