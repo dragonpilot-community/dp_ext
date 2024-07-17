@@ -1,6 +1,7 @@
 import numpy as np
 import json
 import bisect
+from collections import deque
 from openpilot.common.params import Params
 
 class PersonalizedAccelController:
@@ -23,7 +24,7 @@ class PersonalizedAccelController:
         self.MAX_VALS = np.maximum(0, np.interp(self.A_MAX_BP, original_bp, original_vals)).tolist()
         self.A_CRUISE_MAX_VALS = self.MAX_VALS.copy()
 
-        self.speed_range_samples = {i: [] for i in range(self.profile_size)}
+        self.speed_range_samples = {i: deque(maxlen=self.max_samples_per_range) for i in range(self.profile_size)}
 
         self.load_model()
 
@@ -31,24 +32,15 @@ class PersonalizedAccelController:
         return [5, 5, 8, 8, 10, 10, 12, 12, 15, 15, 20, 20, 25, 30, 35, 35, 40, 40, 40]
 
     def update(self, car_state, lead_present):
-        blinker_off = not car_state.leftBlinker and not car_state.rightBlinker
-        straight_road = abs(car_state.steeringAngleDeg) < 30
+        if (not lead_present and
+                not car_state.leftBlinker and
+                not car_state.rightBlinker and
+                car_state.gasPressed and
+                abs(car_state.steeringAngleDeg) < 30):
 
-        if not lead_present and blinker_off and car_state.gasPressed and straight_road:
-            speed = car_state.vEgo
-            acceleration = car_state.aEgo
+            speed_index = self._get_speed_index(car_state.vEgo)
+            self.speed_range_samples[speed_index].append(car_state.aEgo)
 
-            speed_index = self._get_speed_index(speed)
-
-            # Ensure the speed_index exists in the dictionary
-            if speed_index not in self.speed_range_samples:
-                self.speed_range_samples[speed_index] = []
-
-            self.speed_range_samples[speed_index].append(acceleration)
-            if len(self.speed_range_samples[speed_index]) > self.max_samples_per_range:
-                self.speed_range_samples[speed_index] = self.speed_range_samples[speed_index][-self.max_samples_per_range:]
-
-            # Ensure speed_index exists in samples_per_range
             if speed_index < len(self.samples_per_range):
                 if len(self.speed_range_samples[speed_index]) >= self.samples_per_range[speed_index]:
                     self._update_cruise_profile_for_index(speed_index)
@@ -61,7 +53,7 @@ class PersonalizedAccelController:
         return min(bisect.bisect_right(self.A_MAX_BP, speed) - 1, len(self.A_MAX_BP) - 1)
 
     def _update_cruise_profile_for_index(self, index):
-        samples = self.speed_range_samples[index]
+        samples = list(self.speed_range_samples[index])
         if samples:
             new_sample_val = max(0, float(np.percentile(samples, 95)))
 
@@ -69,8 +61,6 @@ class PersonalizedAccelController:
             smoothed_val = self.smoothing_factor * previous_val + (1 - self.smoothing_factor) * new_sample_val
 
             self.A_CRUISE_MAX_VALS[index] = previous_val * (1 - self.learning_rate) + smoothed_val * self.learning_rate
-
-            self.speed_range_samples[index] = []  # Clear the samples after updating
 
     def get_max_accel(self, v_ego, STOCK_BP, STOCK_VALS):
         if self.enabled:
@@ -81,7 +71,7 @@ class PersonalizedAccelController:
     def set_profile_size(self, new_size):
         self.profile_size = new_size
         self.A_CRUISE_MAX_VALS = list(np.linspace(1.6, 0.6, num=new_size))
-        self.speed_range_samples = {i: [] for i in range(self.profile_size)}
+        self.speed_range_samples = {i: deque(maxlen=self.max_samples_per_range) for i in range(self.profile_size)}
 
     def set_enabled(self, enabled):
         self.enabled = enabled
