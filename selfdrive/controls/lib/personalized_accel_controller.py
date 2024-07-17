@@ -50,7 +50,8 @@ class PersonalizedAccelController:
                 self.save_model()
 
     def _get_speed_index(self, speed):
-        return min(bisect.bisect_right(self.A_MAX_BP, speed) - 1, len(self.A_MAX_BP) - 1)
+        index = bisect.bisect_right(self.A_MAX_BP, speed) - 1
+        return max(0, min(index, len(self.A_MAX_BP) - 1))
 
     def _update_cruise_profile_for_index(self, index):
         samples = list(self.speed_range_samples[index])
@@ -112,7 +113,7 @@ class PersonalizedAccelController:
             sm.update()
             if sm.updated['carState']:
                 self.update(sm['carState'], sm['radarState'].leadOne.status and sm['carState'].vEgo > 0. and sm['radarState'].leadOne.dRel / sm['carState'].vEgo < 2.5)
-                print(self.A_CRUISE_MAX_VALS)
+                # print(self.A_CRUISE_MAX_VALS)
 
 def main():
     pac = PersonalizedAccelController()
