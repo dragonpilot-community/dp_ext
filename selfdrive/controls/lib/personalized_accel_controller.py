@@ -111,7 +111,7 @@ class PersonalizedAccelController:
         while True:
             sm.update()
             if sm.updated['carState']:
-                self.update(sm['carState'], sm['radarState'].leadOne.status and sm['carState'].vEgo > 0. and sm['radarState'].leadOne.dRel / sm['carState'].vEgo < 1.)
+                self.update(sm['carState'], sm['radarState'].leadOne.status and sm['carState'].vEgo > 0. and sm['radarState'].leadOne.dRel / sm['carState'].vEgo < 2.5)
                 print(self.A_CRUISE_MAX_VALS)
 
 def main():
