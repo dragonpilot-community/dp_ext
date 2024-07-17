@@ -85,7 +85,10 @@ class PersonalizedAccelController:
         self._params.put("dp_long_pac_vals", json.dumps(data))
 
     def load_model(self):
-        params_val = self._params.get("dp_long_pac_vals")
+        try:
+          params_val = self._params.get("dp_long_pac_vals")
+        except:
+          params_val = None
         if params_val is not None:
             data = json.loads(params_val)
             self.A_CRUISE_MAX_VALS = np.maximum(0, np.interp(self.A_MAX_BP, data.get('bp'), data.get('vals'))).tolist()

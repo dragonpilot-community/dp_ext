@@ -41,6 +41,10 @@ class Position:
         self.speed = speed  # Speed in meters per second
         self.turn_signal = turn_signal  # 'left', 'right', or None
 
+    @property
+    def pos(self):
+        return (self.lat, self.lon, self.bearing, self.speed, self.turn_signal)
+
 @dataclass
 class OnWayResult:
     on_way: bool
@@ -159,6 +163,9 @@ class MapMatcher:
     def _get_candidate_ways(self, nearby_ways: List[Way], pos: Position) -> List[Tuple[Way, OnWayResult]]:
         return [(way, self.on_way(way, pos)) for way in nearby_ways if self.on_way(way, pos).on_way]
 
+    def _are_ways_connected(self, way1: Way, way2: Way) -> bool:
+        return any(node in way2.nodes for node in [way1.nodes[0], way1.nodes[-1]])
+
     def _select_best_match(self, candidates: List[Tuple[Way, OnWayResult]], pos: Position, timestamp: float) -> Optional[Tuple[Way, OnWayResult, float]]:
         if not candidates:
             return None
@@ -191,21 +198,77 @@ class MapMatcher:
         return (best_way, best_on_way_result, self._calculate_confidence(best_way, best_on_way_result, pos))
 
     def _score_candidate(self, way: Way, on_way_result: OnWayResult, pos: Position) -> float:
-        score = self._score_distance(on_way_result.distance)
-        score += self._score_continuity(way)
-        score += self._score_trajectory(pos)
-        score += self._score_speed(pos.speed)
-        score += self._score_historical_matches(way)
-        score += self._score_turn_signals(way, pos)
-        score += self._score_elevation(way)
-        score += self._score_one_way(way, on_way_result)
+        score = 0
+
+        logger.debug(f"{way.name} ({way.id})")
+        logger.debug(f"{pos.pos}")
+        logger.debug(f"{way.tags}")
+        # Distance score
+        distance_score = self._score_distance(on_way_result.distance)
+        score += distance_score
+        logger.debug(f"distance_score: {distance_score}")
+
+        # Continuity score (heavily weighted)
+        continuity_score = self._score_continuity(way) * 2  # Double the weight
+        score += continuity_score
+        logger.debug(f"continuity_score: {continuity_score}")
+
+        # Trajectory score
+        trajectory_score = self._score_trajectory(pos)
+        score += trajectory_score
+        logger.debug(f"trajectory_score: {trajectory_score}")
+
+        # Speed score
+        speed_score = self._score_speed(pos.speed)
+        score += speed_score
+        logger.debug(f"speed_score: {speed_score}")
+
+        # Historical matches score
+        historical_score = self._score_historical_matches(way)
+        score += historical_score
+        logger.debug(f"historical_score: {historical_score}")
+
+        # Turn signals score
+        turn_signals_score = self._score_turn_signals(way, pos)
+        score += turn_signals_score
+        logger.debug(f"turn_signals_score: {turn_signals_score}")
+
+        # Layer difference score
+        layer_score = self._score_layer_difference(way) * 2  # Double the weight
+        score += layer_score
+        logger.debug(f"layer_score: {layer_score}")
+
+        # One-way score
+        one_way_score = self._score_one_way(way, on_way_result)
+        score += one_way_score
+        logger.debug(f"one_way_score: {one_way_score}")
+
+        # Connectivity score
+        connectivity_score = self._score_connectivity(way) * 2  # Double the weight
+        score += connectivity_score
+        logger.debug(f"connectivity_score: {connectivity_score}")
+        logger.debug(f"total score: {score}")
+
         return score
 
     def _score_distance(self, distance: float) -> float:
         return 100 - distance
 
     def _score_continuity(self, way: Way) -> float:
-        return 50 if self.current_way and way.id == self.current_way.way.id else 0
+        return 50 if self.current_way and way.id == self.current_way.way.id else -25  # Penalize switches
+
+    def _score_layer_difference(self, way: Way) -> float:
+        if not self.current_way:
+            return 0
+        layer_diff = abs(int(way.tags.get('layer', '0')) - int(self.current_way.way.tags.get('layer', '0')))
+        return -20 * layer_diff  # Penalize layer differences
+
+    def _score_connectivity(self, way: Way) -> float:
+        if not self.current_way:
+            return 0
+        if self._are_ways_connected(self.current_way.way, way):
+            return 50
+        return -50  # Penalize non-connected ways
 
     def _score_trajectory(self, pos: Position) -> float:
         if len(self.position_history) < 2:
@@ -234,18 +297,6 @@ class MapMatcher:
         way_bearing = self._calculate_bearing(way.nodes[0], way.nodes[-1])
         return 20 if (pos.turn_signal == 'left' and way_bearing < pos.bearing) or \
                      (pos.turn_signal == 'right' and way_bearing > pos.bearing) else 0
-
-    def _score_elevation(self, way: Way) -> float:
-        if not self.current_way:
-            return 0
-        score = 0
-        if way.layer != self.current_layer:
-            score -= 50
-        if way.bridge != self.current_way.way.bridge:
-            score -= 30
-        if way.tunnel != self.current_way.way.tunnel:
-            score -= 30
-        return score
 
     def _score_one_way(self, way: Way, on_way_result: OnWayResult) -> float:
         return -100 if way.oneway and not on_way_result.is_forward else 0
@@ -278,11 +329,18 @@ class MapMatcher:
             logger.info(f"Matched to way: {way.id} with confidence {confidence:.2f}")
             self.position_history.append(pos)
             self.way_history.append(way)
-            return self._update_current_way(pos, way, on_way_result, confidence)
+            new_current_way = self._update_current_way(pos, way, on_way_result, confidence)
 
-        logger.warning("No matching way found")
-        self.current_way = None
-        return None
+            # Add a check to ensure current_way is not None
+            if new_current_way is not None:
+                self.current_way = new_current_way
+                return self.current_way
+            else:
+                logger.warning("_update_current_way returned None. Keeping previous current_way.")
+                return self.current_way
+
+        logger.warning("No matching way found. Keeping previous current_way.")
+        return self.current_way  # Return the previous current_way instead of None
 
     def on_way(self, way: Way, pos: Position) -> OnWayResult:
         distance = self._distance_to_way(pos.lat, pos.lon, way.id)
@@ -352,10 +410,14 @@ class MapMatcher:
         bearing = np.arctan2(y, x)
         return (np.degrees(bearing) + 360) % 360
 
-    def _update_current_way(self, pos: Position, way: Way, on_way: OnWayResult, confidence: float) -> CurrentWay:
-        start, end = self._get_way_start_end(way, on_way.is_forward)
-        self.current_layer = way.layer
-        return CurrentWay(way, on_way.distance, on_way, start, end, confidence)
+    def _update_current_way(self, pos: Position, way: Way, on_way: OnWayResult, confidence: float) -> Optional[CurrentWay]:
+        try:
+            start, end = self._get_way_start_end(way, on_way.is_forward)
+            self.current_layer = int(way.tags.get('layer', '0'))
+            return CurrentWay(way, on_way.distance, on_way, start, end, confidence)
+        except Exception as e:
+            logger.error(f"Error in _update_current_way: {str(e)}")
+            return None  # Return None if there's an error, but log it
 
     @staticmethod
     def _get_way_start_end(way: Way, is_forward: bool) -> Tuple[Coordinates, Coordinates]:
