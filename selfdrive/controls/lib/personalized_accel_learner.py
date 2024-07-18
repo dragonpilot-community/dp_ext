@@ -6,6 +6,7 @@ from openpilot.common.params import Params
 
 class PersonalizedAccelController:
     def __init__(self, learning_rate=0.01):
+class PersonalizedAccelLearner:
         self.enabled = False
         self._params = Params()
         self.learning_rate = learning_rate
@@ -119,7 +120,7 @@ class PersonalizedAccelController:
                 # print(self.A_CRUISE_MAX_VALS)
 
 def main():
-    pac = PersonalizedAccelController()
+    pac = PersonalizedAccelLearner()
     pac.pac_thread()
 
 if __name__ == "__main__":
