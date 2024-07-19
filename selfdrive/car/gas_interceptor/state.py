@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-from openpilot.dp_ext.selfdrive.car.gas_interceptor.common import ENABLED
 from opendbc.can.parser import CANParser
 from cereal import messaging
 
 class GasInterceptorState:
-    def __init__(self):
-        self._enabled = ENABLED
+    def __init__(self, enabled):
+        self._enabled = enabled
 
         if self._enabled:
             self.can_sock = messaging.sub_sock('can')

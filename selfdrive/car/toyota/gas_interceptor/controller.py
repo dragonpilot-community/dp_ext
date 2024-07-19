@@ -12,7 +12,7 @@ PEDAL_TRANSITION = 10. * CV.MPH_TO_MS
 
 class ToyotaGasInterceptorController(GasInterceptorController):
     def __init__(self, CP):
-        super().__init__()
+        super().__init__(CP.enableGasInterceptorDEPRECATED)
         self.interceptor_cmd = 0.
         self.car_fingerprint = CP.carFingerprint
 

@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
-from openpilot.dp_ext.selfdrive.car.gas_interceptor.common import ENABLED
 from openpilot.dp_ext.selfdrive.car.gas_interceptor.can import create_gas_interceptor_command
 from opendbc.can.packer import CANPacker
 
 class GasInterceptorController:
-    def __init__(self):
-        self._enabled = ENABLED
+    def __init__(self, enabled):
+        self._enabled = enabled
         self.packer = CANPacker("gas_interceptor")
         pass
 
