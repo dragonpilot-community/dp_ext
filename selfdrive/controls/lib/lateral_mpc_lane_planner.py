@@ -88,7 +88,7 @@ class LateralMpcLanePlanner:
     # 3 secs
     if self.frame % 60 == 0:
       try:
-        self._dp_lat_lane_priority_mode_speed = int(self.params.get("dp_lat_lane_priority_mode")) * CV.KPH_TO_MS
+        self._dp_lat_lane_priority_mode_speed = int(self.params.get("dp_lat_lane_priority_mode_speed")) * CV.KPH_TO_MS
       except (ValueError, TypeError):
         self._dp_lat_lane_priority_mode_speed = 0.
 
