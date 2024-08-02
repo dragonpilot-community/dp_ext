@@ -1,6 +1,11 @@
+# dp - from original drive_helpers
+MIN_SPEED = 1.0
+CONTROL_N = 17
+# EU guidelines
+MAX_LATERAL_JERK = 5.0
 
 # dp - for lat priority mode
-from openpilot.common.numpy_fast import interp
+from openpilot.common.numpy_fast import interp, clip
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.common.realtime import DT_MDL
 def get_lag_adjusted_curvature(CP, v_ego, psis, curvatures): #, curvature_rates):
