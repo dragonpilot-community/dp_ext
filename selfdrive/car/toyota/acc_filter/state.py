@@ -5,6 +5,7 @@ from openpilot.selfdrive.car.toyota.values import ToyotaFlags
 
 from opendbc.can.parser import CANParser
 from cereal import messaging
+from openpilot.selfdrive.pandad import can_capnp_to_list
 
 class ACCFilterState:
     def __init__(self, CP):
@@ -23,7 +24,8 @@ class ACCFilterState:
             return prev_distance_button, distance_button
 
         can_strings = messaging.drain_sock_raw(self.can_sock, wait_for_one=True)
-        self.can_parser.update_strings(can_strings)
+        can_list = can_capnp_to_list(can_strings)
+        self.can_parser.update_strings(can_list)
 
         prev_distance_button = distance_button
         return prev_distance_button, self.can_parser.vl["SDSU"]['FD_BUTTON']
